@@ -1,0 +1,37 @@
+# Valgrind suppression file for dad-gpt
+# Suppresses known false positives from CUDA runtime libraries
+
+{
+   cuda_runtime_init
+   Memcheck:Leak
+   ...
+   obj:*/libcuda.so*
+}
+
+{
+   cuda_runtime_leak
+   Memcheck:Leak
+   ...
+   obj:*/libcudart.so*
+}
+
+{
+   cuda_driver_leak
+   Memcheck:Leak
+   ...
+   fun:*cuInit*
+}
+
+{
+   cuda_device_query
+   Memcheck:Leak
+   ...
+   fun:*cudaGetDeviceCount*
+}
+
+{
+   cuda_malloc_leak
+   Memcheck:Leak
+   ...
+   fun:*cudaMalloc*
+}

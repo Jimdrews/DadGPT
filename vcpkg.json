@@ -4,6 +4,6 @@
   "description": "A small GPT-style transformer that generates dad jokes",
   "dependencies": [
     "nlohmann-json",
-    "catch2"
+    "gtest"
   ]
 }

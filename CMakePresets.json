@@ -57,5 +57,14 @@
       "name": "clang",
       "configurePreset": "clang"
     }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }
