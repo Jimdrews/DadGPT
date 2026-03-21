@@ -1,0 +1,9 @@
+{
+  "name": "dad-gpt",
+  "version-string": "0.1.0",
+  "description": "A small GPT-style transformer that generates dad jokes",
+  "dependencies": [
+    "nlohmann-json",
+    "catch2"
+  ]
+}

@@ -1,0 +1,30 @@
+# Build output
+build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# vcpkg installed packages
+vcpkg_installed/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data (keep directory, ignore contents)
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
+
+# CUDA build artifacts
+*.o
+*.a
+*.so
