@@ -8,8 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "backward.hpp"
-#include "tensor_ops.hpp"
+#include "gpu_ops.cuh"
 
 namespace {
 
@@ -75,7 +74,11 @@ ActivationOffsets compute_act_offsets(const ModelConfig& c) {
     ly.q = alloc(sd);
     ly.k = alloc(sd);
     ly.v = alloc(sd);
+    ly.q_heads = alloc(sd);  // [n_heads × seq_len × d_head]
+    ly.k_heads = alloc(sd);
+    ly.v_heads = alloc(sd);
     ly.attn_scores = alloc(static_cast<size_t>(c.n_heads) * c.ctx_len * c.ctx_len);
+    ly.attn_out_heads = alloc(sd);  // [n_heads × seq_len × d_head]
     ly.attn_out = alloc(sd);
     ly.attn_proj = alloc(sd);
     ly.residual1 = alloc(sd);
@@ -93,68 +96,51 @@ ActivationOffsets compute_act_offsets(const ModelConfig& c) {
   return a;
 }
 
+// Generate weights on CPU, then copy to GPU
 void init_weights(Model& model) {
   const auto& c = model.config;
+  size_t total = model.param_offsets.total;
+  std::vector<float> h_params(total, 0.0f);
+
   std::mt19937 rng(42);
 
-  // Xavier uniform for weight matrices
-  auto xavier_init = [&](float* w, int fan_in, int fan_out, int count) {
+  auto xavier_init = [&](size_t offset, int fan_in, int fan_out, int count) {
     float limit = std::sqrt(6.0f / static_cast<float>(fan_in + fan_out));
     std::uniform_real_distribution<float> dist(-limit, limit);
-    for (int i = 0; i < count; ++i) {
-      w[i] = dist(rng);
-    }
+    for (int i = 0; i < count; ++i) h_params[offset + i] = dist(rng);
   };
 
-  // Normal distribution for embeddings
-  auto normal_init = [&](float* w, int count, float std_dev) {
+  auto normal_init = [&](size_t offset, int count, float std_dev) {
     std::normal_distribution<float> dist(0.0f, std_dev);
-    for (int i = 0; i < count; ++i) {
-      w[i] = dist(rng);
-    }
+    for (int i = 0; i < count; ++i) h_params[offset + i] = dist(rng);
   };
 
-  // Zero init
-  auto zero_init = [](float* w, int count) { std::memset(w, 0, count * sizeof(float)); };
+  const auto& po = model.param_offsets;
 
-  // Embeddings
-  normal_init(model.param(model.param_offsets.tok_emb), c.vocab_size * c.d_model, 0.02f);
-  normal_init(model.param(model.param_offsets.pos_emb), c.ctx_len * c.d_model, 0.02f);
+  normal_init(po.tok_emb, c.vocab_size * c.d_model, 0.02f);
+  normal_init(po.pos_emb, c.ctx_len * c.d_model, 0.02f);
 
-  // Per-layer weights
   for (int l = 0; l < c.n_layers; ++l) {
-    const auto& ly = model.param_offsets.layers[l];
+    const auto& ly = po.layers[l];
 
-    // LayerNorm: weight=1, bias=0
     for (int i = 0; i < c.d_model; ++i) {
-      model.param(ly.ln1_w)[i] = 1.0f;
-      model.param(ly.ln2_w)[i] = 1.0f;
+      h_params[ly.ln1_w + i] = 1.0f;
+      h_params[ly.ln2_w + i] = 1.0f;
     }
-    zero_init(model.param(ly.ln1_b), c.d_model);
-    zero_init(model.param(ly.ln2_b), c.d_model);
 
-    // Attention weights
-    xavier_init(model.param(ly.Wq), c.d_model, c.d_model, c.d_model * c.d_model);
-    xavier_init(model.param(ly.Wk), c.d_model, c.d_model, c.d_model * c.d_model);
-    xavier_init(model.param(ly.Wv), c.d_model, c.d_model, c.d_model * c.d_model);
-    xavier_init(model.param(ly.Wo), c.d_model, c.d_model, c.d_model * c.d_model);
-    zero_init(model.param(ly.bq), c.d_model);
-    zero_init(model.param(ly.bk), c.d_model);
-    zero_init(model.param(ly.bv), c.d_model);
-    zero_init(model.param(ly.bo), c.d_model);
-
-    // MLP weights
-    xavier_init(model.param(ly.fc1_w), c.d_model, c.d_ff, c.d_model * c.d_ff);
-    zero_init(model.param(ly.fc1_b), c.d_ff);
-    xavier_init(model.param(ly.fc2_w), c.d_ff, c.d_model, c.d_ff * c.d_model);
-    zero_init(model.param(ly.fc2_b), c.d_model);
+    xavier_init(ly.Wq, c.d_model, c.d_model, c.d_model * c.d_model);
+    xavier_init(ly.Wk, c.d_model, c.d_model, c.d_model * c.d_model);
+    xavier_init(ly.Wv, c.d_model, c.d_model, c.d_model * c.d_model);
+    xavier_init(ly.Wo, c.d_model, c.d_model, c.d_model * c.d_model);
+    xavier_init(ly.fc1_w, c.d_model, c.d_ff, c.d_model * c.d_ff);
+    xavier_init(ly.fc2_w, c.d_ff, c.d_model, c.d_ff * c.d_model);
   }
 
-  // Final layernorm
   for (int i = 0; i < c.d_model; ++i) {
-    model.param(model.param_offsets.lnf_w)[i] = 1.0f;
+    h_params[po.lnf_w + i] = 1.0f;
   }
-  zero_init(model.param(model.param_offsets.lnf_b), c.d_model);
+
+  gpu_copy_to_device(model.params, h_params.data(), total);
 }
 
 }  // namespace
@@ -164,49 +150,58 @@ void model_alloc(Model& model, const ModelConfig& config) {
   model.param_offsets = compute_param_offsets(config);
   model.act_offsets = compute_act_offsets(config);
 
-  model.params = new float[model.param_offsets.total]();
-  model.activations = new float[model.act_offsets.total]();
-  model.gradients = new float[model.param_offsets.total]();
-  model.grad_activations = new float[model.act_offsets.total]();
+  model.params = gpu_alloc(model.param_offsets.total);
+  model.activations = gpu_alloc(model.act_offsets.total);
+  model.gradients = gpu_alloc(model.param_offsets.total);
+  model.grad_activations = gpu_alloc(model.act_offsets.total);
+  model.d_tokens = gpu_alloc_u16(config.ctx_len);
+
+  gpu_zero(model.params, model.param_offsets.total);
+  gpu_zero(model.activations, model.act_offsets.total);
+  gpu_zero(model.gradients, model.param_offsets.total);
+  gpu_zero(model.grad_activations, model.act_offsets.total);
+
+  CUBLAS_CHECK(cublasCreate(&model.cublas_handle));
 
   init_weights(model);
 }
 
 void model_free(Model& model) {
-  delete[] model.params;
-  delete[] model.activations;
-  delete[] model.gradients;
-  delete[] model.grad_activations;
+  if (model.cublas_handle) cublasDestroy(model.cublas_handle);
+  gpu_free(model.params);
+  gpu_free(model.activations);
+  gpu_free(model.gradients);
+  gpu_free(model.grad_activations);
+  gpu_free(model.d_tokens);
   model.params = nullptr;
   model.activations = nullptr;
   model.gradients = nullptr;
   model.grad_activations = nullptr;
+  model.d_tokens = nullptr;
+  model.cublas_handle = nullptr;
 }
 
 void model_zero_grad(Model& model) {
-  std::memset(model.gradients, 0, model.param_offsets.total * sizeof(float));
-  std::memset(model.grad_activations, 0, model.act_offsets.total * sizeof(float));
+  gpu_zero(model.gradients, model.param_offsets.total);
+  gpu_zero(model.grad_activations, model.act_offsets.total);
 }
 
 void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
   const auto& c = model.config;
   const auto& po = model.param_offsets;
   const auto& ao = model.act_offsets;
+  auto h = model.cublas_handle;
   int d = c.d_model;
-  int dh = c.d_head();
 
-  // 1. Token embedding + positional embedding
-  float* embedded = model.act(ao.embedded);
-  embedding_lookup(embedded, tokens, model.param(po.tok_emb), seq_len, d);
+  // Copy tokens to device
+  gpu_copy_u16_to_device(model.d_tokens, tokens, seq_len);
 
-  // Add positional embeddings
-  const float* pos_emb = model.param(po.pos_emb);
-  for (int i = 0; i < seq_len * d; ++i) {
-    embedded[i] += pos_emb[i];
-  }
+  // 1. Embedding + positional
+  gpu_embedding_lookup(model.act(ao.embedded), model.d_tokens, model.param(po.tok_emb), seq_len, d);
+  gpu_add_vectors(model.act(ao.embedded), model.act(ao.embedded), model.param(po.pos_emb),
+                  seq_len * d);
 
-  // Current residual stream
-  float* residual = embedded;
+  float* residual = model.act(ao.embedded);
 
   // 2. Transformer blocks
   for (int l = 0; l < c.n_layers; ++l) {
@@ -214,309 +209,292 @@ void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
     const auto& la = ao.layers[l];
 
     // LayerNorm 1
-    layernorm(model.act(la.ln1_out), residual, model.param(lp.ln1_w), model.param(lp.ln1_b),
-              seq_len, d);
+    gpu_layernorm(model.act(la.ln1_out), residual, model.param(lp.ln1_w), model.param(lp.ln1_b),
+                  seq_len, d);
 
-    // Q, K, V projections: [seq_len × d_model] × [d_model × d_model] + bias
-    float* q = model.act(la.q);
-    float* k = model.act(la.k);
-    float* v = model.act(la.v);
-    matmul(q, model.act(la.ln1_out), model.param(lp.Wq), seq_len, d, d);
-    matmul(k, model.act(la.ln1_out), model.param(lp.Wk), seq_len, d, d);
-    matmul(v, model.act(la.ln1_out), model.param(lp.Wv), seq_len, d, d);
+    // Q, K, V projections + bias
+    gpu_matmul(h, model.act(la.q), model.act(la.ln1_out), model.param(lp.Wq), seq_len, d, d);
+    gpu_matmul(h, model.act(la.k), model.act(la.ln1_out), model.param(lp.Wk), seq_len, d, d);
+    gpu_matmul(h, model.act(la.v), model.act(la.ln1_out), model.param(lp.Wv), seq_len, d, d);
 
-    // Add biases
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(q + s * d, q + s * d, model.param(lp.bq), d);
-      add_vectors(k + s * d, k + s * d, model.param(lp.bk), d);
-      add_vectors(v + s * d, v + s * d, model.param(lp.bv), d);
+      gpu_add_vectors(model.act(la.q) + s * d, model.act(la.q) + s * d, model.param(lp.bq), d);
+      gpu_add_vectors(model.act(la.k) + s * d, model.act(la.k) + s * d, model.param(lp.bk), d);
+      gpu_add_vectors(model.act(la.v) + s * d, model.act(la.v) + s * d, model.param(lp.bv), d);
     }
 
-    // Multi-head attention
-    float* attn_scores = model.act(la.attn_scores);
-    float* attn_out = model.act(la.attn_out);
-    float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+    // Multi-head attention using per-head contiguous layout
+    int dh = c.d_head();
 
-    for (int h = 0; h < c.n_heads; ++h) {
-      // Extract head slices: Q_h[seq_len × dh], K_h[seq_len × dh], V_h[seq_len × dh]
-      // They're interleaved in the full Q/K/V: position s, head h → offset s*d + h*dh
+    // Split heads: [seq_len × d_model] → [n_heads × seq_len × d_head]
+    gpu_split_heads(model.act(la.q_heads), model.act(la.q), seq_len, c.n_heads, dh);
+    gpu_split_heads(model.act(la.k_heads), model.act(la.k), seq_len, c.n_heads, dh);
+    gpu_split_heads(model.act(la.v_heads), model.act(la.v), seq_len, c.n_heads, dh);
 
-      // Compute attention scores: Q_h × K_h^T → [seq_len × seq_len]
-      float* scores = attn_scores + static_cast<size_t>(h) * seq_len * seq_len;
+    // Per-head attention: scores = Q_h × K_h^T / sqrt(d_head), then mask + softmax, then attn × V_h
+    for (int head = 0; head < c.n_heads; ++head) {
+      float* q_h = model.act(la.q_heads) + static_cast<size_t>(head) * seq_len * dh;
+      float* k_h = model.act(la.k_heads) + static_cast<size_t>(head) * seq_len * dh;
+      float* v_h = model.act(la.v_heads) + static_cast<size_t>(head) * seq_len * dh;
+      float* scores = model.act(la.attn_scores) + static_cast<size_t>(head) * seq_len * seq_len;
+      float* out_h = model.act(la.attn_out_heads) + static_cast<size_t>(head) * seq_len * dh;
 
-      for (int i = 0; i < seq_len; ++i) {
-        for (int j = 0; j < seq_len; ++j) {
-          float dot = 0.0f;
-          for (int x = 0; x < dh; ++x) {
-            dot += q[i * d + h * dh + x] * k[j * d + h * dh + x];
-          }
-          scores[i * seq_len + j] = dot * scale;
+      // scores = Q_h × K_h^T  [seq_len × seq_len]
+      gpu_matmul_transposed_b(h, scores, q_h, k_h, seq_len, dh, seq_len);
 
-          // Causal mask: set future positions to large negative
-          if (j > i) {
-            scores[i * seq_len + j] = -1e9f;
-          }
-        }
-      }
-
-      // Softmax over each row
-      softmax(scores, scores, seq_len, seq_len);
-
-      // Weighted sum of values: attn × V_h → [seq_len × dh]
-      for (int i = 0; i < seq_len; ++i) {
-        for (int x = 0; x < dh; ++x) {
-          float sum = 0.0f;
-          for (int j = 0; j < seq_len; ++j) {
-            sum += scores[i * seq_len + j] * v[j * d + h * dh + x];
-          }
-          attn_out[i * d + h * dh + x] = sum;
-        }
-      }
+      // Scale by 1/sqrt(d_head)
+      float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+      gpu_scale(scores, seq_len * seq_len, scale);
     }
 
-    // Output projection: attn_out × Wo + bo
-    matmul(model.act(la.attn_proj), attn_out, model.param(lp.Wo), seq_len, d, d);
+    // Causal mask all heads at once
+    gpu_causal_mask(model.act(la.attn_scores), c.n_heads, seq_len);
+
+    // Softmax per head (each head is seq_len rows of seq_len cols)
+    gpu_softmax(model.act(la.attn_scores), model.act(la.attn_scores), c.n_heads * seq_len,
+                seq_len);
+
+    // attn_out = softmax_scores × V_h per head
+    for (int head = 0; head < c.n_heads; ++head) {
+      float* scores = model.act(la.attn_scores) + static_cast<size_t>(head) * seq_len * seq_len;
+      float* v_h = model.act(la.v_heads) + static_cast<size_t>(head) * seq_len * dh;
+      float* out_h = model.act(la.attn_out_heads) + static_cast<size_t>(head) * seq_len * dh;
+
+      gpu_matmul(h, out_h, scores, v_h, seq_len, seq_len, dh);
+    }
+
+    // Merge heads: [n_heads × seq_len × d_head] → [seq_len × d_model]
+    gpu_merge_heads(model.act(la.attn_out), model.act(la.attn_out_heads), seq_len, c.n_heads, dh);
+
+    // Output projection
+    gpu_matmul(h, model.act(la.attn_proj), model.act(la.attn_out), model.param(lp.Wo), seq_len, d,
+               d);
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(model.act(la.attn_proj) + s * d, model.act(la.attn_proj) + s * d,
-                  model.param(lp.bo), d);
+      gpu_add_vectors(model.act(la.attn_proj) + s * d, model.act(la.attn_proj) + s * d,
+                      model.param(lp.bo), d);
     }
 
-    // Residual connection 1
-    add_vectors(model.act(la.residual1), residual, model.act(la.attn_proj), seq_len * d);
+    // Residual 1
+    gpu_add_vectors(model.act(la.residual1), residual, model.act(la.attn_proj), seq_len * d);
 
     // LayerNorm 2
-    layernorm(model.act(la.ln2_out), model.act(la.residual1), model.param(lp.ln2_w),
-              model.param(lp.ln2_b), seq_len, d);
+    gpu_layernorm(model.act(la.ln2_out), model.act(la.residual1), model.param(lp.ln2_w),
+                  model.param(lp.ln2_b), seq_len, d);
 
-    // MLP: fc1 → gelu → fc2
-    matmul(model.act(la.fc1_out), model.act(la.ln2_out), model.param(lp.fc1_w), seq_len, d,
-           c.d_ff);
+    // MLP
+    gpu_matmul(h, model.act(la.fc1_out), model.act(la.ln2_out), model.param(lp.fc1_w), seq_len, d,
+               c.d_ff);
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(model.act(la.fc1_out) + s * c.d_ff, model.act(la.fc1_out) + s * c.d_ff,
-                  model.param(lp.fc1_b), c.d_ff);
+      gpu_add_vectors(model.act(la.fc1_out) + s * c.d_ff, model.act(la.fc1_out) + s * c.d_ff,
+                      model.param(lp.fc1_b), c.d_ff);
     }
 
-    gelu(model.act(la.gelu_out), model.act(la.fc1_out), seq_len * c.d_ff);
+    gpu_gelu(model.act(la.gelu_out), model.act(la.fc1_out), seq_len * c.d_ff);
 
-    matmul(model.act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w), seq_len, c.d_ff,
-           d);
+    gpu_matmul(h, model.act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w), seq_len,
+               c.d_ff, d);
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(model.act(la.fc2_out) + s * d, model.act(la.fc2_out) + s * d,
-                  model.param(lp.fc2_b), d);
+      gpu_add_vectors(model.act(la.fc2_out) + s * d, model.act(la.fc2_out) + s * d,
+                      model.param(lp.fc2_b), d);
     }
 
-    // Residual connection 2
-    add_vectors(model.act(la.residual2), model.act(la.residual1), model.act(la.fc2_out),
-                seq_len * d);
+    // Residual 2
+    gpu_add_vectors(model.act(la.residual2), model.act(la.residual1), model.act(la.fc2_out),
+                    seq_len * d);
 
-    // Update residual pointer for next layer
     residual = model.act(la.residual2);
   }
 
-  // 3. Final layer norm
-  layernorm(model.act(ao.lnf_out), residual, model.param(po.lnf_w), model.param(po.lnf_b),
-            seq_len, d);
+  // 3. Final layernorm
+  gpu_layernorm(model.act(ao.lnf_out), residual, model.param(po.lnf_w), model.param(po.lnf_b),
+                seq_len, d);
 
-  // 4. Logits: lnf_out × tok_emb^T (weight tying)
-  // lnf_out is [seq_len × d], tok_emb is [vocab × d]
-  // out[s][v] = sum_k lnf_out[s][k] * tok_emb[v][k] → matmul with B transposed
-  matmul_transposed_b(model.act(ao.logits), model.act(ao.lnf_out), model.param(po.tok_emb),
-                      seq_len, d, c.vocab_size);
+  // 4. Logits (weight-tied)
+  gpu_matmul_transposed_b(h, model.act(ao.logits), model.act(ao.lnf_out), model.param(po.tok_emb),
+                          seq_len, d, c.vocab_size);
 }
 
 void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
   const auto& c = model.config;
   const auto& po = model.param_offsets;
   const auto& ao = model.act_offsets;
+  auto h = model.cublas_handle;
   int d = c.d_model;
-  int dh = c.d_head();
 
-  // dlogits is assumed to already be set by cross_entropy_loss
+  // 4. Backward logits: logits = lnf_out × tok_emb^T
+  gpu_matmul(h, model.grad_act(ao.lnf_out), model.grad_act(ao.logits), model.param(po.tok_emb),
+             seq_len, c.vocab_size, d);
+  // d_tok_emb += dlogits^T × lnf_out
+  gpu_matmul_transposed_a(h, model.grad(po.tok_emb), model.grad_act(ao.logits),
+                          model.act(ao.lnf_out), c.vocab_size, seq_len, d);
 
-  // 4. Backward through logits: logits = lnf_out × tok_emb^T
-  // dlogits is [seq_len × vocab], lnf_out is [seq_len × d], tok_emb is [vocab × d]
-  // d_lnf_out += dlogits × tok_emb
-  matmul(model.grad_act(ao.lnf_out), model.grad_act(ao.logits), model.param(po.tok_emb), seq_len,
-         c.vocab_size, d);
-  // d_tok_emb += dlogits^T × lnf_out (weight tying)
-  // d_tok_emb[v][k] += sum_s dlogits[s][v] * lnf_out[s][k]
-  for (int s = 0; s < seq_len; ++s) {
-    for (int v = 0; v < c.vocab_size; ++v) {
-      float dl = model.grad_act(ao.logits)[s * c.vocab_size + v];
-      for (int k = 0; k < d; ++k) {
-        model.grad(po.tok_emb)[v * d + k] += dl * model.act(ao.lnf_out)[s * d + k];
-      }
-    }
-  }
+  // 3. Backward final layernorm
+  size_t lnf_in = (c.n_layers > 0) ? ao.layers[c.n_layers - 1].residual2 : ao.embedded;
+  gpu_layernorm_backward(model.grad_act(lnf_in), model.grad(po.lnf_w), model.grad(po.lnf_b),
+                         model.grad_act(ao.lnf_out), model.act(lnf_in), model.param(po.lnf_w),
+                         seq_len, d);
 
-  // 3. Backward through final layernorm
-  // Input to lnf is the last layer's residual2 (or embedded if 0 layers)
-  size_t lnf_input_offset =
-      (c.n_layers > 0) ? ao.layers[c.n_layers - 1].residual2 : ao.embedded;
-  layernorm_backward(model.grad_act(ao.lnf_out), model.act(lnf_input_offset),
-                     model.param(po.lnf_w), model.grad_act(lnf_input_offset),
-                     model.grad(po.lnf_w), model.grad(po.lnf_b), seq_len, d);
-
-  // 2. Backward through transformer blocks (reverse order)
+  // 2. Backward transformer blocks
   for (int l = c.n_layers - 1; l >= 0; --l) {
     const auto& lp = po.layers[l];
     const auto& la = ao.layers[l];
 
-    // d_residual2 flows into this layer
-    // residual2 = residual1 + fc2_out → d_residual1 += d_residual2, d_fc2_out += d_residual2
-    float* d_residual2 = model.grad_act(la.residual2);
-    add_vectors(model.grad_act(la.residual1), model.grad_act(la.residual1), d_residual2,
-                seq_len * d);
-    add_vectors(model.grad_act(la.fc2_out), model.grad_act(la.fc2_out), d_residual2, seq_len * d);
+    // Residual 2 backward
+    gpu_add_vectors(model.grad_act(la.residual1), model.grad_act(la.residual1),
+                    model.grad_act(la.residual2), seq_len * d);
+    gpu_add_vectors(model.grad_act(la.fc2_out), model.grad_act(la.fc2_out),
+                    model.grad_act(la.residual2), seq_len * d);
 
-    // Backward fc2 bias
+    // fc2 bias backward
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(model.grad(lp.fc2_b), model.grad(lp.fc2_b),
-                  model.grad_act(la.fc2_out) + s * d, d);
+      gpu_add_vectors(model.grad(lp.fc2_b), model.grad(lp.fc2_b),
+                      model.grad_act(la.fc2_out) + s * d, d);
     }
 
-    // Backward fc2 matmul: fc2_out = gelu_out × fc2_w
-    matmul_backward(model.grad_act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w),
-                    model.grad_act(la.gelu_out), model.grad(lp.fc2_w), seq_len, c.d_ff, d);
+    // fc2 matmul backward
+    gpu_matmul_backward(h, model.grad_act(la.fc2_out), model.act(la.gelu_out),
+                        model.param(lp.fc2_w), model.grad_act(la.gelu_out), model.grad(lp.fc2_w),
+                        seq_len, c.d_ff, d);
 
-    // Backward GELU
-    gelu_backward(model.grad_act(la.gelu_out), model.act(la.fc1_out), model.grad_act(la.fc1_out),
-                  seq_len * c.d_ff);
+    // GELU backward
+    gpu_gelu_backward(model.grad_act(la.fc1_out), model.grad_act(la.gelu_out),
+                      model.act(la.fc1_out), seq_len * c.d_ff);
 
-    // Backward fc1 bias
+    // fc1 bias backward
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(model.grad(lp.fc1_b), model.grad(lp.fc1_b),
-                  model.grad_act(la.fc1_out) + s * c.d_ff, c.d_ff);
+      gpu_add_vectors(model.grad(lp.fc1_b), model.grad(lp.fc1_b),
+                      model.grad_act(la.fc1_out) + s * c.d_ff, c.d_ff);
     }
 
-    // Backward fc1 matmul: fc1_out = ln2_out × fc1_w
-    matmul_backward(model.grad_act(la.fc1_out), model.act(la.ln2_out), model.param(lp.fc1_w),
-                    model.grad_act(la.ln2_out), model.grad(lp.fc1_w), seq_len, d, c.d_ff);
+    // fc1 matmul backward
+    gpu_matmul_backward(h, model.grad_act(la.fc1_out), model.act(la.ln2_out),
+                        model.param(lp.fc1_w), model.grad_act(la.ln2_out), model.grad(lp.fc1_w),
+                        seq_len, d, c.d_ff);
 
-    // Backward layernorm 2
-    layernorm_backward(model.grad_act(la.ln2_out), model.act(la.residual1), model.param(lp.ln2_w),
-                       model.grad_act(la.residual1), model.grad(lp.ln2_w), model.grad(lp.ln2_b),
-                       seq_len, d);
+    // Layernorm 2 backward
+    gpu_layernorm_backward(model.grad_act(la.residual1), model.grad(lp.ln2_w),
+                           model.grad(lp.ln2_b), model.grad_act(la.ln2_out),
+                           model.act(la.residual1), model.param(lp.ln2_w), seq_len, d);
 
-    // residual1 = prev_residual + attn_proj → d_prev_residual += d_residual1, d_attn_proj +=
-    // d_residual1
-    float* d_residual1 = model.grad_act(la.residual1);
-    size_t prev_residual_offset = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
-    add_vectors(model.grad_act(prev_residual_offset), model.grad_act(prev_residual_offset),
-                d_residual1, seq_len * d);
-    add_vectors(model.grad_act(la.attn_proj), model.grad_act(la.attn_proj), d_residual1,
-                seq_len * d);
+    // Residual 1 backward
+    size_t prev = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
+    gpu_add_vectors(model.grad_act(prev), model.grad_act(prev), model.grad_act(la.residual1),
+                    seq_len * d);
+    gpu_add_vectors(model.grad_act(la.attn_proj), model.grad_act(la.attn_proj),
+                    model.grad_act(la.residual1), seq_len * d);
 
-    // Backward output projection bias
+    // Output projection bias backward
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(model.grad(lp.bo), model.grad(lp.bo),
-                  model.grad_act(la.attn_proj) + s * d, d);
+      gpu_add_vectors(model.grad(lp.bo), model.grad(lp.bo),
+                      model.grad_act(la.attn_proj) + s * d, d);
     }
 
-    // Backward output projection matmul: attn_proj = attn_out × Wo
-    matmul_backward(model.grad_act(la.attn_proj), model.act(la.attn_out), model.param(lp.Wo),
-                    model.grad_act(la.attn_out), model.grad(lp.Wo), seq_len, d, d);
+    // Output projection matmul backward
+    gpu_matmul_backward(h, model.grad_act(la.attn_proj), model.act(la.attn_out),
+                        model.param(lp.Wo), model.grad_act(la.attn_out), model.grad(lp.Wo),
+                        seq_len, d, d);
 
-    // Backward multi-head attention
-    float* dq = model.grad_act(la.q);
-    float* dk = model.grad_act(la.k);
-    float* dv = model.grad_act(la.v);
-    float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+    // Attention backward (per-head layout)
+    int dh = c.d_head();
 
-    for (int h = 0; h < c.n_heads; ++h) {
-      float* d_attn_out = model.grad_act(la.attn_out);
-      float* scores = model.act(la.attn_scores) + static_cast<size_t>(h) * seq_len * seq_len;
+    // d_attn_out is in [seq_len × d_model] — split to per-head
+    gpu_split_heads(model.grad_act(la.attn_out_heads), model.grad_act(la.attn_out), seq_len,
+                    c.n_heads, dh);
 
-      // d_scores from d_attn_out: d_attn_out[i][h*dh+x] = sum_j scores[i][j] * v[j][h*dh+x]
-      // d_scores[i][j] += sum_x d_attn_out[i][h*dh+x] * v[j][h*dh+x]
-      // d_v[j][h*dh+x] += sum_i scores[i][j] * d_attn_out[i][h*dh+x]
-      std::vector<float> d_scores(static_cast<size_t>(seq_len) * seq_len, 0.0f);
+    for (int head = 0; head < c.n_heads; ++head) {
+      size_t h_off = static_cast<size_t>(head) * seq_len * dh;
+      size_t s_off = static_cast<size_t>(head) * seq_len * seq_len;
 
-      for (int i = 0; i < seq_len; ++i) {
-        for (int j = 0; j < seq_len; ++j) {
-          float dot = 0.0f;
-          for (int x = 0; x < dh; ++x) {
-            dot += d_attn_out[i * d + h * dh + x] *
-                   model.act(la.v)[j * d + h * dh + x];
-          }
-          d_scores[i * seq_len + j] = dot;
+      float* d_out_h = model.grad_act(la.attn_out_heads) + h_off;
+      float* scores = model.act(la.attn_scores) + s_off;
+      float* v_h = model.act(la.v_heads) + h_off;
 
-          // dv
-          for (int x = 0; x < dh; ++x) {
-            dv[j * d + h * dh + x] +=
-                scores[i * seq_len + j] * d_attn_out[i * d + h * dh + x];
-          }
-        }
-      }
+      // d_scores += d_out_h × V_h^T
+      float* d_scores_h = model.grad_act(la.attn_scores) + s_off;
+      gpu_matmul_transposed_b(model.cublas_handle, d_scores_h, d_out_h, v_h, seq_len, dh,
+                              seq_len);
 
-      // Backward softmax on scores
-      std::vector<float> d_raw_scores(static_cast<size_t>(seq_len) * seq_len, 0.0f);
-      softmax_backward(d_scores.data(), scores, d_raw_scores.data(), seq_len, seq_len);
-
-      // Apply causal mask gradient (masked positions had -1e9, gradient is 0)
-      for (int i = 0; i < seq_len; ++i) {
-        for (int j = i + 1; j < seq_len; ++j) {
-          d_raw_scores[i * seq_len + j] = 0.0f;
-        }
-      }
-
-      // d_raw_scores = d(Q K^T / sqrt(dh))
-      // dq[i][h*dh+x] += sum_j d_raw_scores[i][j] * k[j][h*dh+x] * scale
-      // dk[j][h*dh+x] += sum_i d_raw_scores[i][j] * q[i][h*dh+x] * scale
-      for (int i = 0; i < seq_len; ++i) {
-        for (int j = 0; j < seq_len; ++j) {
-          float ds = d_raw_scores[i * seq_len + j] * scale;
-          for (int x = 0; x < dh; ++x) {
-            dq[i * d + h * dh + x] += ds * model.act(la.k)[j * d + h * dh + x];
-            dk[j * d + h * dh + x] += ds * model.act(la.q)[i * d + h * dh + x];
-          }
-        }
-      }
+      // d_v_h += scores^T × d_out_h
+      gpu_matmul_transposed_a(model.cublas_handle, model.grad_act(la.v_heads) + h_off, scores,
+                              d_out_h, dh, seq_len, dh);
     }
 
-    // Backward Q/K/V biases
+    // Softmax backward on all heads at once
+    gpu_softmax_backward(model.grad_act(la.attn_scores), model.grad_act(la.attn_scores),
+                         model.act(la.attn_scores), c.n_heads * seq_len, seq_len);
+
+    // Zero out causal mask positions in d_scores
+    gpu_causal_mask(model.grad_act(la.attn_scores), c.n_heads, seq_len);
+
+    // Scale backward
+    float attn_scale = 1.0f / std::sqrt(static_cast<float>(dh));
+    gpu_scale(model.grad_act(la.attn_scores), c.n_heads * seq_len * seq_len, attn_scale);
+
+    // d_q_heads and d_k_heads from d_scores
+    for (int head = 0; head < c.n_heads; ++head) {
+      size_t h_off = static_cast<size_t>(head) * seq_len * dh;
+      size_t s_off = static_cast<size_t>(head) * seq_len * seq_len;
+
+      float* d_scores_h = model.grad_act(la.attn_scores) + s_off;
+      float* k_h = model.act(la.k_heads) + h_off;
+      float* q_h = model.act(la.q_heads) + h_off;
+
+      // d_q_h += d_scores × K_h
+      gpu_matmul(model.cublas_handle, model.grad_act(la.q_heads) + h_off, d_scores_h, k_h,
+                 seq_len, seq_len, dh);
+
+      // d_k_h += d_scores^T × Q_h
+      gpu_matmul_transposed_a(model.cublas_handle, model.grad_act(la.k_heads) + h_off, d_scores_h,
+                              q_h, dh, seq_len, dh);
+    }
+
+    // Merge head gradients back to [seq_len × d_model]
+    gpu_merge_heads(model.grad_act(la.q), model.grad_act(la.q_heads), seq_len, c.n_heads, dh);
+    gpu_merge_heads(model.grad_act(la.k), model.grad_act(la.k_heads), seq_len, c.n_heads, dh);
+    gpu_merge_heads(model.grad_act(la.v), model.grad_act(la.v_heads), seq_len, c.n_heads, dh);
+
+    // Q/K/V bias backward
     for (int s = 0; s < seq_len; ++s) {
-      add_vectors(model.grad(lp.bq), model.grad(lp.bq), dq + s * d, d);
-      add_vectors(model.grad(lp.bk), model.grad(lp.bk), dk + s * d, d);
-      add_vectors(model.grad(lp.bv), model.grad(lp.bv), dv + s * d, d);
+      gpu_add_vectors(model.grad(lp.bq), model.grad(lp.bq), model.grad_act(la.q) + s * d, d);
+      gpu_add_vectors(model.grad(lp.bk), model.grad(lp.bk), model.grad_act(la.k) + s * d, d);
+      gpu_add_vectors(model.grad(lp.bv), model.grad(lp.bv), model.grad_act(la.v) + s * d, d);
     }
 
-    // Backward Q/K/V matmuls
-    matmul_backward(dq, model.act(la.ln1_out), model.param(lp.Wq), model.grad_act(la.ln1_out),
-                    model.grad(lp.Wq), seq_len, d, d);
-    matmul_backward(dk, model.act(la.ln1_out), model.param(lp.Wk), model.grad_act(la.ln1_out),
-                    model.grad(lp.Wk), seq_len, d, d);
-    matmul_backward(dv, model.act(la.ln1_out), model.param(lp.Wv), model.grad_act(la.ln1_out),
-                    model.grad(lp.Wv), seq_len, d, d);
+    // Q/K/V matmul backward
+    gpu_matmul_backward(h, model.grad_act(la.q), model.act(la.ln1_out), model.param(lp.Wq),
+                        model.grad_act(la.ln1_out), model.grad(lp.Wq), seq_len, d, d);
+    gpu_matmul_backward(h, model.grad_act(la.k), model.act(la.ln1_out), model.param(lp.Wk),
+                        model.grad_act(la.ln1_out), model.grad(lp.Wk), seq_len, d, d);
+    gpu_matmul_backward(h, model.grad_act(la.v), model.act(la.ln1_out), model.param(lp.Wv),
+                        model.grad_act(la.ln1_out), model.grad(lp.Wv), seq_len, d, d);
 
-    // Backward layernorm 1
-    size_t ln1_input_offset = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
-    layernorm_backward(model.grad_act(la.ln1_out), model.act(ln1_input_offset),
-                       model.param(lp.ln1_w), model.grad_act(ln1_input_offset),
-                       model.grad(lp.ln1_w), model.grad(lp.ln1_b), seq_len, d);
+    // Layernorm 1 backward
+    size_t ln1_in = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
+    gpu_layernorm_backward(model.grad_act(ln1_in), model.grad(lp.ln1_w), model.grad(lp.ln1_b),
+                           model.grad_act(la.ln1_out), model.act(ln1_in), model.param(lp.ln1_w),
+                           seq_len, d);
   }
 
-  // 1. Backward through embeddings
-  // d_embedded has accumulated gradients from the first transformer block
-  embedding_backward(model.grad_act(ao.embedded), tokens, model.grad(po.tok_emb), seq_len, d);
-
-  // Positional embedding gradients
-  for (int i = 0; i < seq_len * d; ++i) {
-    model.grad(po.pos_emb)[i] += model.grad_act(ao.embedded)[i];
-  }
+  // 1. Embedding backward
+  gpu_embedding_backward(model.grad(po.tok_emb), model.grad_act(ao.embedded), model.d_tokens,
+                         seq_len, d);
+  gpu_add_vectors(model.grad(po.pos_emb), model.grad(po.pos_emb), model.grad_act(ao.embedded),
+                  seq_len * d);
 }
 
 void model_save(const Model& model, const std::string& path) {
   std::ofstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("Cannot write " + path);
 
-  // Write config
   f.write(reinterpret_cast<const char*>(&model.config), sizeof(ModelConfig));
 
-  // Write params
   auto num_params = static_cast<uint64_t>(model.param_offsets.total);
   f.write(reinterpret_cast<const char*>(&num_params), sizeof(num_params));
-  f.write(reinterpret_cast<const char*>(model.params),
+
+  // Copy params from GPU to host, then write
+  std::vector<float> h_params(num_params);
+  gpu_copy_to_host(h_params.data(), model.params, num_params);
+  f.write(reinterpret_cast<const char*>(h_params.data()),
           static_cast<std::streamsize>(num_params * sizeof(float)));
 }
 
@@ -524,16 +502,17 @@ void model_load(Model& model, const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("Cannot read " + path);
 
-  // Read config
   ModelConfig config{};
   f.read(reinterpret_cast<char*>(&config), sizeof(ModelConfig));
 
-  // Allocate model (this also initializes weights, but we'll overwrite them)
   model_alloc(model, config);
 
-  // Read params
   uint64_t num_params = 0;
   f.read(reinterpret_cast<char*>(&num_params), sizeof(num_params));
-  f.read(reinterpret_cast<char*>(model.params),
+
+  // Read to host buffer, then copy to GPU
+  std::vector<float> h_params(num_params);
+  f.read(reinterpret_cast<char*>(h_params.data()),
          static_cast<std::streamsize>(num_params * sizeof(float)));
+  gpu_copy_to_device(model.params, h_params.data(), num_params);
 }

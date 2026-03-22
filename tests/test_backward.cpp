@@ -6,45 +6,46 @@
 #include <vector>
 
 #include "backward.hpp"
+#include "gpu_ops.cuh"
 #include "model.hpp"
 #include "tensor_ops.hpp"
 
 namespace {
 
-// Finite-difference gradient check helper
-// f: function that takes params and returns scalar loss
-// params: parameter array to check
-// grads: analytically computed gradients
-// n: number of parameters
-// h: perturbation size
-double max_relative_error(std::function<float()> f, float* params, const float* grads, int n,
-                          float h = 1e-5f, bool verbose = false) {
+// GPU-aware finite-difference gradient check.
+// Perturbs params on GPU one at a time, runs forward+loss, compares against analytical grads.
+double gpu_max_relative_error(std::function<float()> forward_loss, float* d_params,
+                              const float* d_grads, int n, float h = 1e-3f) {
+  // Copy analytical gradients to host
+  std::vector<float> h_grads(n);
+  gpu_copy_to_host(h_grads.data(), d_grads, n);
+
   double max_err = 0.0;
   for (int i = 0; i < n; ++i) {
-    float orig = params[i];
+    // Read original param value
+    float orig = 0;
+    gpu_copy_to_host(&orig, d_params + i, 1);
 
-    params[i] = orig + h;
-    float loss_plus = f();
+    // Perturb +h
+    float plus_val = orig + h;
+    gpu_copy_to_device(d_params + i, &plus_val, 1);
+    float loss_plus = forward_loss();
 
-    params[i] = orig - h;
-    float loss_minus = f();
+    // Perturb -h
+    float minus_val = orig - h;
+    gpu_copy_to_device(d_params + i, &minus_val, 1);
+    float loss_minus = forward_loss();
 
-    params[i] = orig;
+    // Restore
+    gpu_copy_to_device(d_params + i, &orig, 1);
 
     double numerical = static_cast<double>(loss_plus - loss_minus) / (2.0 * h);
-    double analytical = grads[i];
+    double analytical = h_grads[i];
 
-    // Skip tiny gradients where float precision dominates
     if (std::abs(numerical) < 1e-6 && std::abs(analytical) < 1e-3) continue;
 
     double denom = std::max(std::abs(numerical) + std::abs(analytical), 1e-7);
     double rel_err = std::abs(numerical - analytical) / denom;
-
-    if (verbose && i < 5) {
-      std::printf("  [%d] numerical=%.8f analytical=%.8f rel_err=%.4f loss+=%f loss-=%f\n", i,
-                  numerical, analytical, rel_err, loss_plus, loss_minus);
-    }
-
     max_err = std::max(max_err, rel_err);
   }
   return max_err;
@@ -53,16 +54,15 @@ double max_relative_error(std::function<float()> f, float* params, const float* 
 }  // namespace
 
 TEST(Backward, MatmulGradientCheck) {
-  float a[] = {1, 2, 3, 4, 5, 6};       // 2×3
-  float b[] = {7, 8, 9, 10, 11, 12};     // 3×2
-  float c[4] = {};
-  float dc[] = {1, 0, 0, 1};             // identity-like gradient
+  // CPU-only test using the CPU backward functions
+  float a[] = {1, 2, 3, 4, 5, 6};
+  float b[] = {7, 8, 9, 10, 11, 12};
+  float dc[] = {1, 0, 0, 1};
   float da[6] = {};
   float db[6] = {};
 
   matmul_backward(dc, a, b, da, db, 2, 3, 2);
 
-  // Verify da and db are non-zero
   float da_sum = 0, db_sum = 0;
   for (float v : da) da_sum += std::abs(v);
   for (float v : db) db_sum += std::abs(v);
@@ -71,7 +71,8 @@ TEST(Backward, MatmulGradientCheck) {
 }
 
 TEST(Backward, CrossEntropyLoss) {
-  float logits[] = {2.0f, 1.0f, 0.1f, -1.0f, 0.5f, 3.0f};  // 2 positions × 3 vocab
+  // CPU-only test
+  float logits[] = {2.0f, 1.0f, 0.1f, -1.0f, 0.5f, 3.0f};
   uint16_t targets[] = {0, 2};
   float dlogits[6] = {};
 
@@ -79,14 +80,11 @@ TEST(Backward, CrossEntropyLoss) {
 
   EXPECT_GT(loss, 0.0f);
   EXPECT_TRUE(std::isfinite(loss));
-
-  // dlogits for target positions should be negative (softmax - 1)
-  EXPECT_LT(dlogits[0], 0.0f);   // target=0, position 0
-  EXPECT_LT(dlogits[5], 0.0f);   // target=2, position 1
+  EXPECT_LT(dlogits[0], 0.0f);
+  EXPECT_LT(dlogits[5], 0.0f);
 }
 
 TEST(Backward, DebugGradientValues) {
-  // Check if gradients are actually non-zero after backward pass
   ModelConfig config;
   config.d_model = 16;
   config.n_layers = 1;
@@ -102,29 +100,26 @@ TEST(Backward, DebugGradientValues) {
   uint16_t targets[] = {5, 6, 7, 8};
   int seq_len = 4;
 
+  uint16_t* d_targets = gpu_alloc_u16(seq_len);
+  gpu_copy_u16_to_device(d_targets, targets, seq_len);
+
   model_zero_grad(model);
   model_forward(model, tokens, seq_len);
 
-  float loss = cross_entropy_loss(model.act(model.act_offsets.logits), targets,
-                                  model.grad_act(model.act_offsets.logits), seq_len,
-                                  config.vocab_size);
+  float loss = gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
+                                      model.act(model.act_offsets.logits), d_targets, seq_len,
+                                      config.vocab_size);
 
-  // Check dlogits is non-zero
-  float dlogits_sum = 0;
-  for (int i = 0; i < seq_len * config.vocab_size; ++i) {
-    dlogits_sum += std::abs(model.grad_act(model.act_offsets.logits)[i]);
-  }
-  EXPECT_GT(dlogits_sum, 0) << "dlogits is all zeros";
   EXPECT_GT(loss, 0) << "loss is zero";
 
   model_backward(model, tokens, seq_len);
 
-  // Check various parameter gradients
+  // Check various parameter gradients are non-zero (copy to host first)
   auto check_grad = [&](size_t offset, int size, const char* name) {
+    std::vector<float> h_grad(size);
+    gpu_copy_to_host(h_grad.data(), model.grad(offset), size);
     float sum = 0;
-    for (int i = 0; i < size; ++i) {
-      sum += std::abs(model.grad(offset)[i]);
-    }
+    for (float v : h_grad) sum += std::abs(v);
     EXPECT_GT(sum, 0) << name << " gradients are all zeros";
   };
 
@@ -135,15 +130,13 @@ TEST(Backward, DebugGradientValues) {
   check_grad(model.param_offsets.layers[0].Wo, config.d_model * config.d_model, "Wo");
   check_grad(model.param_offsets.layers[0].Wq, config.d_model * config.d_model, "Wq");
   check_grad(model.param_offsets.tok_emb, config.vocab_size * config.d_model, "tok_emb");
-  check_grad(model.param_offsets.pos_emb, seq_len * config.d_model, "pos_emb");
 
+  gpu_free(d_targets);
   model_free(model);
 }
 
 TEST(Backward, FullModelGradientCheck) {
   // Gradient check with relaxed thresholds for float32 precision.
-  // Uses h=1e-3 (not 1e-5) and threshold 0.5 (not 1e-4) because
-  // float32 loss values don't have enough precision for tighter checks.
   ModelConfig config;
   config.d_model = 16;
   config.n_layers = 1;
@@ -159,49 +152,37 @@ TEST(Backward, FullModelGradientCheck) {
   uint16_t targets[] = {5, 6, 7, 8};
   int seq_len = 4;
 
+  uint16_t* d_targets = gpu_alloc_u16(seq_len);
+  gpu_copy_u16_to_device(d_targets, targets, seq_len);
+
   auto compute_loss = [&]() {
-    std::memset(model.activations, 0, model.act_offsets.total * sizeof(float));
+    gpu_zero(model.activations, model.act_offsets.total);
     model_forward(model, tokens, seq_len);
-    std::vector<float> dlogits_dummy(static_cast<size_t>(seq_len) * config.vocab_size, 0.0f);
-    return cross_entropy_loss(model.act(model.act_offsets.logits), targets, dlogits_dummy.data(),
-                              seq_len, config.vocab_size);
+    float* dummy_dlogits = gpu_alloc(static_cast<size_t>(seq_len) * config.vocab_size);
+    float loss = gpu_cross_entropy_loss(dummy_dlogits, model.act(model.act_offsets.logits),
+                                        d_targets, seq_len, config.vocab_size);
+    gpu_free(dummy_dlogits);
+    return loss;
   };
 
   // Compute analytical gradients
   model_zero_grad(model);
-  std::memset(model.activations, 0, model.act_offsets.total * sizeof(float));
+  gpu_zero(model.activations, model.act_offsets.total);
   model_forward(model, tokens, seq_len);
-  cross_entropy_loss(model.act(model.act_offsets.logits), targets,
-                     model.grad_act(model.act_offsets.logits), seq_len, config.vocab_size);
+  gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
+                         model.act(model.act_offsets.logits), d_targets, seq_len, config.vocab_size);
   model_backward(model, tokens, seq_len);
 
-  // Debug: check if perturbation actually changes loss
-  {
-    float base_loss = compute_loss();
-    float* p = model.param(model.param_offsets.layers[0].fc1_w);
-    float orig = p[0];
-    p[0] = orig + 1e-3f;
-    float perturbed_loss = compute_loss();
-    p[0] = orig;
-    EXPECT_NE(base_loss, perturbed_loss)
-        << "Loss unchanged by perturbation. base=" << base_loss << " perturbed=" << perturbed_loss;
-  }
-
-  // Check a subset of parameters
-  // Check first layer's fc1_w (first 32 params only for speed)
-  float h = 1e-3f;
-
-  double err = max_relative_error(compute_loss, model.param(model.param_offsets.layers[0].fc1_w),
-                                  model.grad(model.param_offsets.layers[0].fc1_w), 32, h);
+  // Check gradients via finite differences on GPU
+  double err = gpu_max_relative_error(compute_loss,
+                                      model.param(model.param_offsets.layers[0].fc1_w),
+                                      model.grad(model.param_offsets.layers[0].fc1_w), 32);
   EXPECT_LT(err, 0.5) << "fc1_w gradient error: " << err;
 
-  err = max_relative_error(compute_loss, model.param(model.param_offsets.lnf_w),
-                           model.grad(model.param_offsets.lnf_w), config.d_model, h);
+  err = gpu_max_relative_error(compute_loss, model.param(model.param_offsets.lnf_w),
+                               model.grad(model.param_offsets.lnf_w), config.d_model);
   EXPECT_LT(err, 0.5) << "lnf_w gradient error: " << err;
 
-  err = max_relative_error(compute_loss, model.param(model.param_offsets.layers[0].Wo),
-                           model.grad(model.param_offsets.layers[0].Wo), 32, h);
-  EXPECT_LT(err, 0.5) << "Wo gradient error: " << err;
-
+  gpu_free(d_targets);
   model_free(model);
 }

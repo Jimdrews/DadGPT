@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cublas_v2.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -38,16 +40,18 @@ struct ActivationOffsets {
 
   struct LayerActivations {
     size_t ln1_out;
-    size_t q, k, v;          // [seq_len × d_model]
-    size_t attn_scores;      // [n_heads × seq_len × seq_len]
-    size_t attn_out;         // [seq_len × d_model]
-    size_t attn_proj;        // [seq_len × d_model]
-    size_t residual1;        // [seq_len × d_model]
+    size_t q, k, v;              // [seq_len × d_model] (after projection)
+    size_t q_heads, k_heads, v_heads;  // [n_heads × seq_len × d_head] (reshaped for cuBLAS)
+    size_t attn_scores;          // [n_heads × seq_len × seq_len]
+    size_t attn_out_heads;       // [n_heads × seq_len × d_head]
+    size_t attn_out;             // [seq_len × d_model] (reshaped back)
+    size_t attn_proj;            // [seq_len × d_model]
+    size_t residual1;            // [seq_len × d_model]
     size_t ln2_out;
-    size_t fc1_out;          // [seq_len × d_ff]
-    size_t gelu_out;         // [seq_len × d_ff]
-    size_t fc2_out;          // [seq_len × d_model]
-    size_t residual2;        // [seq_len × d_model]
+    size_t fc1_out;              // [seq_len × d_ff]
+    size_t gelu_out;             // [seq_len × d_ff]
+    size_t fc2_out;              // [seq_len × d_model]
+    size_t residual2;            // [seq_len × d_model]
   };
   std::vector<LayerActivations> layers;
 
@@ -58,12 +62,15 @@ struct ActivationOffsets {
 
 struct Model {
   ModelConfig config;
+  // All pointers are GPU device memory
   float* params = nullptr;
   float* activations = nullptr;
   float* gradients = nullptr;
   float* grad_activations = nullptr;
+  uint16_t* d_tokens = nullptr;  // device buffer for input tokens
   ParameterOffsets param_offsets;
   ActivationOffsets act_offsets;
+  cublasHandle_t cublas_handle = nullptr;
 
   float* param(size_t offset) { return params + offset; }
   const float* param(size_t offset) const { return params + offset; }

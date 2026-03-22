@@ -6,8 +6,8 @@
 #include <iostream>
 #include <regex>
 
-#include "backward.hpp"
 #include "dataloader.hpp"
+#include "gpu_ops.cuh"
 #include "model.hpp"
 #include "optimizer.hpp"
 
@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 void run_training(const TrainConfig& tc) {
   std::cout << "=== dad-gpt train ===\n\n";
 
-  // Check for existing checkpoint to resume from
+  // Check for existing checkpoint
   std::string resume_path;
   int resume_epoch = 0;
   {
@@ -50,11 +50,15 @@ void run_training(const TrainConfig& tc) {
   std::cout << std::format("Model: {} params, d_model={}, n_layers={}, n_heads={}\n",
                            model.param_offsets.total, mc.d_model, mc.n_layers, mc.n_heads);
 
-  // Initialize optimizer
+  // Initialize optimizer — m and v on GPU
   Adam opt;
   opt.max_lr = 3e-4f;
   opt.warmup_steps = 100;
-  adam_alloc(opt, model.param_offsets.total);
+  opt.num_params = model.param_offsets.total;
+  opt.m = gpu_alloc(model.param_offsets.total);
+  opt.v = gpu_alloc(model.param_offsets.total);
+  gpu_zero(opt.m, model.param_offsets.total);
+  gpu_zero(opt.v, model.param_offsets.total);
 
   // Open data files
   DataLoader train_loader(tc.data_dir + "/train.bin", tc.batch_size, tc.seq_len);
@@ -63,7 +67,9 @@ void run_training(const TrainConfig& tc) {
                            val_loader.num_tokens());
   std::cout << std::format("Batch size: {}, Seq len: {}\n\n", tc.batch_size, tc.seq_len);
 
-  // Estimate total steps for LR schedule
+  // Device buffer for targets
+  uint16_t* d_targets = gpu_alloc_u16(tc.seq_len);
+
   size_t tokens_per_batch =
       static_cast<size_t>(tc.batch_size) * static_cast<size_t>(tc.seq_len + 1);
   size_t batches_per_epoch = train_loader.num_tokens() / tokens_per_batch;
@@ -79,38 +85,44 @@ void run_training(const TrainConfig& tc) {
     while (train_loader.has_next()) {
       Batch batch = train_loader.next_batch();
 
-      // Zero gradients for this batch
       model_zero_grad(model);
       float batch_loss = 0.0f;
 
-      // Forward + backward for each sequence in the batch
       for (int b = 0; b < tc.batch_size; ++b) {
-        std::memset(model.activations, 0, model.act_offsets.total * sizeof(float));
-        std::memset(model.grad_activations, 0, model.act_offsets.total * sizeof(float));
+        gpu_zero(model.activations, model.act_offsets.total);
+        gpu_zero(model.grad_activations, model.act_offsets.total);
 
+        // Forward pass (tokens copied to device inside model_forward)
         model_forward(model, batch.tokens[b].data(), tc.seq_len);
 
-        float loss = cross_entropy_loss(model.act(model.act_offsets.logits),
-                                        batch.targets[b].data(),
-                                        model.grad_act(model.act_offsets.logits), tc.seq_len,
-                                        mc.vocab_size);
+        // Copy targets to device for cross-entropy
+        gpu_copy_u16_to_device(d_targets, batch.targets[b].data(), tc.seq_len);
+
+        // Loss + dlogits on GPU
+        float loss = gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
+                                            model.act(model.act_offsets.logits), d_targets,
+                                            tc.seq_len, mc.vocab_size);
 
         model_backward(model, batch.tokens[b].data(), tc.seq_len);
         batch_loss += loss;
       }
 
-      // Average gradients over batch
+      // Average gradients
       float inv_batch = 1.0f / static_cast<float>(tc.batch_size);
-      for (size_t i = 0; i < model.param_offsets.total; ++i) {
-        model.gradients[i] *= inv_batch;
-      }
+      gpu_gradient_scale(model.gradients, model.param_offsets.total, inv_batch);
       batch_loss *= inv_batch;
 
-      // Gradient clipping
-      gradient_clip(model.gradients, model.param_offsets.total, 1.0f);
+      // Gradient clipping on GPU
+      float norm = gpu_gradient_norm(model.gradients, model.param_offsets.total);
+      if (norm > 1.0f) {
+        gpu_gradient_scale(model.gradients, model.param_offsets.total, 1.0f / norm);
+      }
 
-      // Optimizer step
-      adam_step(opt, model.params, model.gradients);
+      // Adam step on GPU
+      ++opt.step;
+      float lr = adam_lr(opt);
+      gpu_adam_step(model.params, model.gradients, opt.m, opt.v, model.param_offsets.total, lr,
+                    opt.beta1, opt.beta2, opt.eps, opt.step);
 
       epoch_loss += batch_loss;
       ++epoch_steps;
@@ -119,7 +131,7 @@ void run_training(const TrainConfig& tc) {
       if (global_step % tc.log_interval == 0) {
         float avg_loss = epoch_loss / static_cast<float>(epoch_steps);
         std::cout << std::format("  step {:>5d} | loss {:.4f} | lr {:.6f}\n", global_step,
-                                 avg_loss, adam_lr(opt));
+                                 avg_loss, lr);
       }
     }
 
@@ -129,12 +141,14 @@ void run_training(const TrainConfig& tc) {
     int val_steps = 0;
     while (val_loader.has_next()) {
       Batch vb = val_loader.next_batch();
-      std::memset(model.activations, 0, model.act_offsets.total * sizeof(float));
+      gpu_zero(model.activations, model.act_offsets.total);
       model_forward(model, vb.tokens[0].data(), tc.seq_len);
 
-      std::vector<float> dummy_dlogits(static_cast<size_t>(tc.seq_len) * mc.vocab_size, 0.0f);
-      val_loss += cross_entropy_loss(model.act(model.act_offsets.logits), vb.targets[0].data(),
-                                     dummy_dlogits.data(), tc.seq_len, mc.vocab_size);
+      gpu_copy_u16_to_device(d_targets, vb.targets[0].data(), tc.seq_len);
+      float* dummy_dlogits = gpu_alloc(static_cast<size_t>(tc.seq_len) * mc.vocab_size);
+      val_loss += gpu_cross_entropy_loss(dummy_dlogits, model.act(model.act_offsets.logits),
+                                         d_targets, tc.seq_len, mc.vocab_size);
+      gpu_free(dummy_dlogits);
       ++val_steps;
     }
 
@@ -143,13 +157,15 @@ void run_training(const TrainConfig& tc) {
     std::cout << std::format("Epoch {:>2d} | train_loss {:.4f} | val_loss {:.4f}\n", epoch + 1,
                              avg_train, avg_val);
 
-    // Save checkpoint
-    std::string ckpt_path = tc.data_dir + "/checkpoint_epoch_" + std::to_string(epoch + 1) + ".bin";
+    std::string ckpt_path =
+        tc.data_dir + "/checkpoint_epoch_" + std::to_string(epoch + 1) + ".bin";
     model_save(model, ckpt_path);
     std::cout << std::format("  Saved {}\n\n", ckpt_path);
   }
 
-  adam_free(opt);
+  gpu_free(d_targets);
+  gpu_free(opt.m);
+  gpu_free(opt.v);
   model_free(model);
   std::cout << "Training complete!\n";
 }
