@@ -24,7 +24,6 @@ jobs:
         with:
           cuda: '12.6.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "curand-dev"]'
 
       - name: Install clang-format and clang-tidy
         run: |
