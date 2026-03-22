@@ -2,6 +2,7 @@
   "name": "dad-gpt",
   "version-string": "0.1.0",
   "description": "A small GPT-style transformer that generates dad jokes",
+  "builtin-baseline": "00d9442575734640fadd99579b0a99cbc7baa352",
   "dependencies": [
     "nlohmann-json",
     "gtest"
