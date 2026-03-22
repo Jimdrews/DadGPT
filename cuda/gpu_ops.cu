@@ -325,6 +325,24 @@ void gpu_causal_mask(float* scores, int n_heads, int seq_len) {
   CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void causal_mask_zero_kernel(float* grads, int seq_len) {
+  int h = blockIdx.z;
+  int i = blockIdx.y;
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= seq_len) return;
+  if (j > i) {
+    grads[h * seq_len * seq_len + i * seq_len + j] = 0.0f;
+  }
+}
+
+void gpu_causal_mask_zero(float* grads, int n_heads, int seq_len) {
+  int threads = min(256, seq_len);
+  int j_blocks = (seq_len + threads - 1) / threads;
+  dim3 grid(j_blocks, seq_len, n_heads);
+  causal_mask_zero_kernel<<<grid, threads>>>(grads, seq_len);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 // Scale a matrix: out[i] *= scale
 __global__ void scale_matrix_kernel(float* data, int size, float scale) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;

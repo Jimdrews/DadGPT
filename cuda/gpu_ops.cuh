@@ -75,8 +75,10 @@ void gpu_embedding_backward(float* dtable, const float* dout, const uint16_t* to
 void gpu_split_heads(float* out, const float* in, int seq_len, int n_heads, int d_head);
 // Reshape [n_heads × seq_len × d_head] → [seq_len × d_model] (merge heads)
 void gpu_merge_heads(float* out, const float* in, int seq_len, int n_heads, int d_head);
-// Apply causal mask: set scores[i][j] = -1e9 where j > i
+// Apply causal mask: set scores[i][j] = -1e9 where j > i (forward pass)
 void gpu_causal_mask(float* scores, int n_heads, int seq_len);
+// Zero out causal mask positions: set grads[i][j] = 0 where j > i (backward pass)
+void gpu_causal_mask_zero(float* grads, int n_heads, int seq_len);
 // Scale all elements: data[i] *= scale
 void gpu_scale(float* data, int size, float scale);
 

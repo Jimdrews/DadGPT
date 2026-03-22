@@ -414,17 +414,17 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
       gpu_matmul_transposed_b(model.cublas_handle, d_scores_h, d_out_h, v_h, seq_len, dh,
                               seq_len);
 
-      // d_v_h += scores^T × d_out_h
+      // d_v_h += scores^T × d_out_h  (scores is [S×S], d_out_h is [S×dh], result is [S×dh])
       gpu_matmul_transposed_a(model.cublas_handle, model.grad_act(la.v_heads) + h_off, scores,
-                              d_out_h, dh, seq_len, dh);
+                              d_out_h, seq_len, seq_len, dh);
     }
 
     // Softmax backward on all heads at once
     gpu_softmax_backward(model.grad_act(la.attn_scores), model.grad_act(la.attn_scores),
                          model.act(la.attn_scores), c.n_heads * seq_len, seq_len);
 
-    // Zero out causal mask positions in d_scores
-    gpu_causal_mask(model.grad_act(la.attn_scores), c.n_heads, seq_len);
+    // Zero out causal mask positions in d_scores (not -1e9 — that's for forward only)
+    gpu_causal_mask_zero(model.grad_act(la.attn_scores), c.n_heads, seq_len);
 
     // Scale backward
     float attn_scale = 1.0f / std::sqrt(static_cast<float>(dh));
@@ -443,9 +443,9 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
       gpu_matmul(model.cublas_handle, model.grad_act(la.q_heads) + h_off, d_scores_h, k_h,
                  seq_len, seq_len, dh);
 
-      // d_k_h += d_scores^T × Q_h
+      // d_k_h += d_scores^T × Q_h  (d_scores is [S×S], Q_h is [S×dh], result is [S×dh])
       gpu_matmul_transposed_a(model.cublas_handle, model.grad_act(la.k_heads) + h_off, d_scores_h,
-                              q_h, dh, seq_len, dh);
+                              q_h, seq_len, seq_len, dh);
     }
 
     // Merge head gradients back to [seq_len × d_model]
