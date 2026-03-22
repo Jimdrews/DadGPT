@@ -6,6 +6,7 @@
 #include "bpe.hpp"
 #include "csv_parser.hpp"
 #include "dataloader.hpp"
+#include "generate.hpp"
 #include "train.hpp"
 
 namespace {
@@ -118,11 +119,37 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc >= 2 && std::string(argv[1]) == "generate") {
+    GenerateConfig gc;
+    for (int i = 2; i < argc; ++i) {
+      std::string arg = argv[i];
+      if (arg == "--checkpoint" && i + 1 < argc) {
+        gc.checkpoint_path = argv[++i];
+      } else if (arg == "--vocab" && i + 1 < argc) {
+        gc.vocab_path = argv[++i];
+      } else if (arg == "--merges" && i + 1 < argc) {
+        gc.merges_path = argv[++i];
+      } else if (arg == "--temp" && i + 1 < argc) {
+        gc.temperature = std::stof(argv[++i]);
+      } else if (arg == "--top-k" && i + 1 < argc) {
+        gc.top_k = std::stoi(argv[++i]);
+      } else if (arg == "--count" && i + 1 < argc) {
+        gc.count = std::stoi(argv[++i]);
+      } else if (arg == "--prompt" && i + 1 < argc) {
+        gc.prompt = argv[++i];
+      }
+    }
+    run_generate(gc);
+    return 0;
+  }
+
   std::cout << std::format("dad-gpt v0.1.0 | C++{}\n", __cplusplus);
   std::cout << "\nUsage: dad-gpt <command>\n";
   std::cout << "  prepare [data_dir]              - Tokenize dataset\n";
   std::cout << "  train [--epochs N] [--batch N]  - Train the model\n";
   std::cout << "        [--data DIR]\n";
+  std::cout << "  generate [--temp F] [--top-k N] - Generate jokes\n";
+  std::cout << "           [--count N] [--prompt TEXT]\n";
 
   return 0;
 }
