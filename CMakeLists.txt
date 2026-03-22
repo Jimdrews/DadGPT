@@ -1,23 +1,32 @@
 cmake_minimum_required(VERSION 3.28)
-project(dad-gpt LANGUAGES CXX CUDA)
+project(dad-gpt LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_ARCHITECTURES 86)
-
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(CUDAToolkit REQUIRED)
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  set(CMAKE_CUDA_ARCHITECTURES 86)
+  find_package(CUDAToolkit REQUIRED)
+  add_subdirectory(cuda)
+  set(DAD_GPT_CUDA_ENABLED ON)
+else()
+  message(STATUS "CUDA not found — building without GPU support")
+  set(DAD_GPT_CUDA_ENABLED OFF)
+endif()
+
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 
 enable_testing()
 
-add_subdirectory(cuda)
 add_subdirectory(src)
 add_subdirectory(tests)
 
@@ -62,10 +71,10 @@ add_custom_target(lint
 add_custom_target(memcheck
     COMMAND valgrind --tool=memcheck --leak-check=full
         --suppressions=${CMAKE_SOURCE_DIR}/valgrind.supp
-        $<TARGET_FILE:dad-gpt-tests>
+        $<TARGET_FILE:${PROJECT_NAME}-tests>
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Running valgrind memcheck on tests"
-    DEPENDS dad-gpt-tests
+    DEPENDS ${PROJECT_NAME}-tests
     VERBATIM
 )
 

@@ -2,11 +2,14 @@
 #include <iostream>
 #include <string>
 
+#ifdef DAD_GPT_CUDA_ENABLED
 #include "hello.cuh"
+#endif
 
 int main() {
   std::cout << std::format("dad-gpt v0.1.0 | C++{}\n", __cplusplus);
 
+#ifdef DAD_GPT_CUDA_ENABLED
   int device_count = 0;
   std::string device_name;
 
@@ -18,6 +21,9 @@ int main() {
     std::cerr << "CUDA: no devices found or kernel failed\n";
     return 1;
   }
+#else
+  std::cout << "CUDA: disabled (no GPU toolkit found)\n";
+#endif
 
   return 0;
 }
