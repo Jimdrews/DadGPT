@@ -139,18 +139,18 @@ void run_training(const TrainConfig& tc) {
     val_loader.reset();
     float val_loss = 0.0f;
     int val_steps = 0;
+    float* val_dlogits = gpu_alloc(static_cast<size_t>(tc.seq_len) * mc.vocab_size);
     while (val_loader.has_next()) {
       Batch vb = val_loader.next_batch();
       gpu_zero(model.activations, model.act_offsets.total);
       model_forward(model, vb.tokens[0].data(), tc.seq_len);
 
       gpu_copy_u16_to_device(d_targets, vb.targets[0].data(), tc.seq_len);
-      float* dummy_dlogits = gpu_alloc(static_cast<size_t>(tc.seq_len) * mc.vocab_size);
-      val_loss += gpu_cross_entropy_loss(dummy_dlogits, model.act(model.act_offsets.logits),
+      val_loss += gpu_cross_entropy_loss(val_dlogits, model.act(model.act_offsets.logits),
                                          d_targets, tc.seq_len, mc.vocab_size);
-      gpu_free(dummy_dlogits);
       ++val_steps;
     }
+    gpu_free(val_dlogits);
 
     float avg_train = epoch_loss / static_cast<float>(std::max(epoch_steps, 1));
     float avg_val = val_loss / static_cast<float>(std::max(val_steps, 1));
