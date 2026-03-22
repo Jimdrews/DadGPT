@@ -141,8 +141,9 @@ int main(int argc, char* argv[]) {
 #endif
 
   std::cout << "\nUsage: dad-gpt <command>\n";
-  std::cout << "  prepare [data_dir]    - Tokenize dataset\n";
-  std::cout << "  train [--epochs N]    - Train the model\n";
+  std::cout << "  prepare [data_dir]              - Tokenize dataset\n";
+  std::cout << "  train [--epochs N] [--batch N]  - Train the model\n";
+  std::cout << "        [--data DIR]\n";
 
   return 0;
 }
