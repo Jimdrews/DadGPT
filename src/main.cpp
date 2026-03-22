@@ -6,6 +6,7 @@
 #include "bpe.hpp"
 #include "csv_parser.hpp"
 #include "dataloader.hpp"
+#include "train.hpp"
 
 #ifdef DAD_GPT_CUDA_ENABLED
 #include "hello.cuh"
@@ -105,6 +106,22 @@ int main(int argc, char* argv[]) {
     return prepare(data_dir);
   }
 
+  if (argc >= 2 && std::string(argv[1]) == "train") {
+    TrainConfig tc;
+    for (int i = 2; i < argc; ++i) {
+      std::string arg = argv[i];
+      if (arg == "--epochs" && i + 1 < argc) {
+        tc.epochs = std::stoi(argv[++i]);
+      } else if (arg == "--data" && i + 1 < argc) {
+        tc.data_dir = argv[++i];
+      } else if (arg == "--batch" && i + 1 < argc) {
+        tc.batch_size = std::stoi(argv[++i]);
+      }
+    }
+    run_training(tc);
+    return 0;
+  }
+
   std::cout << std::format("dad-gpt v0.1.0 | C++{}\n", __cplusplus);
 
 #ifdef DAD_GPT_CUDA_ENABLED
@@ -124,7 +141,8 @@ int main(int argc, char* argv[]) {
 #endif
 
   std::cout << "\nUsage: dad-gpt <command>\n";
-  std::cout << "  prepare [data_dir]  - Download and tokenize dataset\n";
+  std::cout << "  prepare [data_dir]    - Tokenize dataset\n";
+  std::cout << "  train [--epochs N]    - Train the model\n";
 
   return 0;
 }

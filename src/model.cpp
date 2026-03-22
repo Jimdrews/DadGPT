@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "backward.hpp"
 #include "tensor_ops.hpp"
 
 namespace {
@@ -165,6 +166,8 @@ void model_alloc(Model& model, const ModelConfig& config) {
 
   model.params = new float[model.param_offsets.total]();
   model.activations = new float[model.act_offsets.total]();
+  model.gradients = new float[model.param_offsets.total]();
+  model.grad_activations = new float[model.act_offsets.total]();
 
   init_weights(model);
 }
@@ -172,8 +175,17 @@ void model_alloc(Model& model, const ModelConfig& config) {
 void model_free(Model& model) {
   delete[] model.params;
   delete[] model.activations;
+  delete[] model.gradients;
+  delete[] model.grad_activations;
   model.params = nullptr;
   model.activations = nullptr;
+  model.gradients = nullptr;
+  model.grad_activations = nullptr;
+}
+
+void model_zero_grad(Model& model) {
+  std::memset(model.gradients, 0, model.param_offsets.total * sizeof(float));
+  std::memset(model.grad_activations, 0, model.act_offsets.total * sizeof(float));
 }
 
 void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
@@ -310,6 +322,188 @@ void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
   // out[s][v] = sum_k lnf_out[s][k] * tok_emb[v][k] → matmul with B transposed
   matmul_transposed_b(model.act(ao.logits), model.act(ao.lnf_out), model.param(po.tok_emb),
                       seq_len, d, c.vocab_size);
+}
+
+void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
+  const auto& c = model.config;
+  const auto& po = model.param_offsets;
+  const auto& ao = model.act_offsets;
+  int d = c.d_model;
+  int dh = c.d_head();
+
+  // dlogits is assumed to already be set by cross_entropy_loss
+
+  // 4. Backward through logits: logits = lnf_out × tok_emb^T
+  // dlogits is [seq_len × vocab], lnf_out is [seq_len × d], tok_emb is [vocab × d]
+  // d_lnf_out += dlogits × tok_emb
+  matmul(model.grad_act(ao.lnf_out), model.grad_act(ao.logits), model.param(po.tok_emb), seq_len,
+         c.vocab_size, d);
+  // d_tok_emb += dlogits^T × lnf_out (weight tying)
+  // d_tok_emb[v][k] += sum_s dlogits[s][v] * lnf_out[s][k]
+  for (int s = 0; s < seq_len; ++s) {
+    for (int v = 0; v < c.vocab_size; ++v) {
+      float dl = model.grad_act(ao.logits)[s * c.vocab_size + v];
+      for (int k = 0; k < d; ++k) {
+        model.grad(po.tok_emb)[v * d + k] += dl * model.act(ao.lnf_out)[s * d + k];
+      }
+    }
+  }
+
+  // 3. Backward through final layernorm
+  // Input to lnf is the last layer's residual2 (or embedded if 0 layers)
+  size_t lnf_input_offset =
+      (c.n_layers > 0) ? ao.layers[c.n_layers - 1].residual2 : ao.embedded;
+  layernorm_backward(model.grad_act(ao.lnf_out), model.act(lnf_input_offset),
+                     model.param(po.lnf_w), model.grad_act(lnf_input_offset),
+                     model.grad(po.lnf_w), model.grad(po.lnf_b), seq_len, d);
+
+  // 2. Backward through transformer blocks (reverse order)
+  for (int l = c.n_layers - 1; l >= 0; --l) {
+    const auto& lp = po.layers[l];
+    const auto& la = ao.layers[l];
+
+    // d_residual2 flows into this layer
+    // residual2 = residual1 + fc2_out → d_residual1 += d_residual2, d_fc2_out += d_residual2
+    float* d_residual2 = model.grad_act(la.residual2);
+    add_vectors(model.grad_act(la.residual1), model.grad_act(la.residual1), d_residual2,
+                seq_len * d);
+    add_vectors(model.grad_act(la.fc2_out), model.grad_act(la.fc2_out), d_residual2, seq_len * d);
+
+    // Backward fc2 bias
+    for (int s = 0; s < seq_len; ++s) {
+      add_vectors(model.grad(lp.fc2_b), model.grad(lp.fc2_b),
+                  model.grad_act(la.fc2_out) + s * d, d);
+    }
+
+    // Backward fc2 matmul: fc2_out = gelu_out × fc2_w
+    matmul_backward(model.grad_act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w),
+                    model.grad_act(la.gelu_out), model.grad(lp.fc2_w), seq_len, c.d_ff, d);
+
+    // Backward GELU
+    gelu_backward(model.grad_act(la.gelu_out), model.act(la.fc1_out), model.grad_act(la.fc1_out),
+                  seq_len * c.d_ff);
+
+    // Backward fc1 bias
+    for (int s = 0; s < seq_len; ++s) {
+      add_vectors(model.grad(lp.fc1_b), model.grad(lp.fc1_b),
+                  model.grad_act(la.fc1_out) + s * c.d_ff, c.d_ff);
+    }
+
+    // Backward fc1 matmul: fc1_out = ln2_out × fc1_w
+    matmul_backward(model.grad_act(la.fc1_out), model.act(la.ln2_out), model.param(lp.fc1_w),
+                    model.grad_act(la.ln2_out), model.grad(lp.fc1_w), seq_len, d, c.d_ff);
+
+    // Backward layernorm 2
+    layernorm_backward(model.grad_act(la.ln2_out), model.act(la.residual1), model.param(lp.ln2_w),
+                       model.grad_act(la.residual1), model.grad(lp.ln2_w), model.grad(lp.ln2_b),
+                       seq_len, d);
+
+    // residual1 = prev_residual + attn_proj → d_prev_residual += d_residual1, d_attn_proj +=
+    // d_residual1
+    float* d_residual1 = model.grad_act(la.residual1);
+    size_t prev_residual_offset = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
+    add_vectors(model.grad_act(prev_residual_offset), model.grad_act(prev_residual_offset),
+                d_residual1, seq_len * d);
+    add_vectors(model.grad_act(la.attn_proj), model.grad_act(la.attn_proj), d_residual1,
+                seq_len * d);
+
+    // Backward output projection bias
+    for (int s = 0; s < seq_len; ++s) {
+      add_vectors(model.grad(lp.bo), model.grad(lp.bo),
+                  model.grad_act(la.attn_proj) + s * d, d);
+    }
+
+    // Backward output projection matmul: attn_proj = attn_out × Wo
+    matmul_backward(model.grad_act(la.attn_proj), model.act(la.attn_out), model.param(lp.Wo),
+                    model.grad_act(la.attn_out), model.grad(lp.Wo), seq_len, d, d);
+
+    // Backward multi-head attention
+    float* dq = model.grad_act(la.q);
+    float* dk = model.grad_act(la.k);
+    float* dv = model.grad_act(la.v);
+    float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+
+    for (int h = 0; h < c.n_heads; ++h) {
+      float* d_attn_out = model.grad_act(la.attn_out);
+      float* scores = model.act(la.attn_scores) + static_cast<size_t>(h) * seq_len * seq_len;
+
+      // d_scores from d_attn_out: d_attn_out[i][h*dh+x] = sum_j scores[i][j] * v[j][h*dh+x]
+      // d_scores[i][j] += sum_x d_attn_out[i][h*dh+x] * v[j][h*dh+x]
+      // d_v[j][h*dh+x] += sum_i scores[i][j] * d_attn_out[i][h*dh+x]
+      std::vector<float> d_scores(static_cast<size_t>(seq_len) * seq_len, 0.0f);
+
+      for (int i = 0; i < seq_len; ++i) {
+        for (int j = 0; j < seq_len; ++j) {
+          float dot = 0.0f;
+          for (int x = 0; x < dh; ++x) {
+            dot += d_attn_out[i * d + h * dh + x] *
+                   model.act(la.v)[j * d + h * dh + x];
+          }
+          d_scores[i * seq_len + j] = dot;
+
+          // dv
+          for (int x = 0; x < dh; ++x) {
+            dv[j * d + h * dh + x] +=
+                scores[i * seq_len + j] * d_attn_out[i * d + h * dh + x];
+          }
+        }
+      }
+
+      // Backward softmax on scores
+      std::vector<float> d_raw_scores(static_cast<size_t>(seq_len) * seq_len, 0.0f);
+      softmax_backward(d_scores.data(), scores, d_raw_scores.data(), seq_len, seq_len);
+
+      // Apply causal mask gradient (masked positions had -1e9, gradient is 0)
+      for (int i = 0; i < seq_len; ++i) {
+        for (int j = i + 1; j < seq_len; ++j) {
+          d_raw_scores[i * seq_len + j] = 0.0f;
+        }
+      }
+
+      // d_raw_scores = d(Q K^T / sqrt(dh))
+      // dq[i][h*dh+x] += sum_j d_raw_scores[i][j] * k[j][h*dh+x] * scale
+      // dk[j][h*dh+x] += sum_i d_raw_scores[i][j] * q[i][h*dh+x] * scale
+      for (int i = 0; i < seq_len; ++i) {
+        for (int j = 0; j < seq_len; ++j) {
+          float ds = d_raw_scores[i * seq_len + j] * scale;
+          for (int x = 0; x < dh; ++x) {
+            dq[i * d + h * dh + x] += ds * model.act(la.k)[j * d + h * dh + x];
+            dk[j * d + h * dh + x] += ds * model.act(la.q)[i * d + h * dh + x];
+          }
+        }
+      }
+    }
+
+    // Backward Q/K/V biases
+    for (int s = 0; s < seq_len; ++s) {
+      add_vectors(model.grad(lp.bq), model.grad(lp.bq), dq + s * d, d);
+      add_vectors(model.grad(lp.bk), model.grad(lp.bk), dk + s * d, d);
+      add_vectors(model.grad(lp.bv), model.grad(lp.bv), dv + s * d, d);
+    }
+
+    // Backward Q/K/V matmuls
+    matmul_backward(dq, model.act(la.ln1_out), model.param(lp.Wq), model.grad_act(la.ln1_out),
+                    model.grad(lp.Wq), seq_len, d, d);
+    matmul_backward(dk, model.act(la.ln1_out), model.param(lp.Wk), model.grad_act(la.ln1_out),
+                    model.grad(lp.Wk), seq_len, d, d);
+    matmul_backward(dv, model.act(la.ln1_out), model.param(lp.Wv), model.grad_act(la.ln1_out),
+                    model.grad(lp.Wv), seq_len, d, d);
+
+    // Backward layernorm 1
+    size_t ln1_input_offset = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
+    layernorm_backward(model.grad_act(la.ln1_out), model.act(ln1_input_offset),
+                       model.param(lp.ln1_w), model.grad_act(ln1_input_offset),
+                       model.grad(lp.ln1_w), model.grad(lp.ln1_b), seq_len, d);
+  }
+
+  // 1. Backward through embeddings
+  // d_embedded has accumulated gradients from the first transformer block
+  embedding_backward(model.grad_act(ao.embedded), tokens, model.grad(po.tok_emb), seq_len, d);
+
+  // Positional embedding gradients
+  for (int i = 0; i < seq_len * d; ++i) {
+    model.grad(po.pos_emb)[i] += model.grad_act(ao.embedded)[i];
+  }
 }
 
 void model_save(const Model& model, const std::string& path) {

@@ -60,12 +60,16 @@ struct Model {
   ModelConfig config;
   float* params = nullptr;
   float* activations = nullptr;
+  float* gradients = nullptr;
+  float* grad_activations = nullptr;
   ParameterOffsets param_offsets;
   ActivationOffsets act_offsets;
 
   float* param(size_t offset) { return params + offset; }
   const float* param(size_t offset) const { return params + offset; }
   float* act(size_t offset) { return activations + offset; }
+  float* grad(size_t offset) { return gradients + offset; }
+  float* grad_act(size_t offset) { return grad_activations + offset; }
 };
 
 // Allocate and initialize model
@@ -74,6 +78,12 @@ void model_free(Model& model);
 
 // Forward pass: tokens[seq_len] → logits stored in model.activations at act_offsets.logits
 void model_forward(Model& model, const uint16_t* tokens, int seq_len);
+
+// Backward pass: compute gradients for all parameters (call after forward + loss)
+void model_backward(Model& model, const uint16_t* tokens, int seq_len);
+
+// Zero all gradients
+void model_zero_grad(Model& model);
 
 // Save/load
 void model_save(const Model& model, const std::string& path);
