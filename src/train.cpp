@@ -1,22 +1,52 @@
 #include "train.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <iostream>
+#include <regex>
 
 #include "backward.hpp"
 #include "dataloader.hpp"
 #include "model.hpp"
 #include "optimizer.hpp"
 
+namespace fs = std::filesystem;
+
 void run_training(const TrainConfig& tc) {
   std::cout << "=== dad-gpt train ===\n\n";
+
+  // Check for existing checkpoint to resume from
+  std::string resume_path;
+  int resume_epoch = 0;
+  {
+    std::regex ckpt_re("checkpoint_epoch_(\\d+)\\.bin");
+    for (const auto& entry : fs::directory_iterator(tc.data_dir)) {
+      std::smatch match;
+      std::string name = entry.path().filename().string();
+      if (std::regex_match(name, match, ckpt_re)) {
+        int epoch = std::stoi(match[1].str());
+        if (epoch > resume_epoch) {
+          resume_epoch = epoch;
+          resume_path = entry.path().string();
+        }
+      }
+    }
+  }
 
   // Initialize model
   ModelConfig mc;
   mc.ctx_len = tc.seq_len;
   Model model{};
-  model_alloc(model, mc);
+
+  if (!resume_path.empty()) {
+    model_load(model, resume_path);
+    std::cout << std::format("Resumed from {} (epoch {})\n", resume_path, resume_epoch);
+  } else {
+    model_alloc(model, mc);
+  }
+  mc = model.config;
+
   std::cout << std::format("Model: {} params, d_model={}, n_layers={}, n_heads={}\n",
                            model.param_offsets.total, mc.d_model, mc.n_layers, mc.n_heads);
 
@@ -41,7 +71,7 @@ void run_training(const TrainConfig& tc) {
 
   int global_step = 0;
 
-  for (int epoch = 0; epoch < tc.epochs; ++epoch) {
+  for (int epoch = resume_epoch; epoch < tc.epochs; ++epoch) {
     train_loader.reset();
     float epoch_loss = 0.0f;
     int epoch_steps = 0;
