@@ -2,6 +2,9 @@
 
 #include <cstdint>
 
+// CPU reference implementations of tensor operations.
+// Used by unit tests. The model uses GPU versions from cuda/gpu_ops.cuh.
+
 // C = A × B where A is (M×K), B is (K×N), C is (M×N)
 void matmul(float* out, const float* a, const float* b, int M, int K, int N);
 
