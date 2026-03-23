@@ -8,12 +8,12 @@
 #include <vector>
 
 struct ModelConfig {
-  int d_model = 256;
-  int n_layers = 4;
-  int n_heads = 4;
-  int d_ff = 1024;
+  int d_model = 512;
+  int n_layers = 8;
+  int n_heads = 8;
+  int d_ff = 2048;
   int ctx_len = 128;
-  int vocab_size = 4096;
+  int vocab_size = 512;
 
   int d_head() const { return d_model / n_heads; }
 };

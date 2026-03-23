@@ -21,9 +21,7 @@ float adam_lr(const Adam& opt) {
   if (opt.step < opt.warmup_steps) {
     return opt.max_lr * static_cast<float>(opt.step) / static_cast<float>(opt.warmup_steps);
   }
-  float progress = static_cast<float>(opt.step - opt.warmup_steps) /
-                   static_cast<float>(std::max(opt.total_steps - opt.warmup_steps, 1));
-  return opt.max_lr * 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * progress));
+  return opt.max_lr;
 }
 
 void adam_step(Adam& opt, float* params, const float* grads) {

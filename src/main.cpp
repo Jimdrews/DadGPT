@@ -12,7 +12,7 @@
 namespace {
 
 int prepare(const std::string& data_dir) {
-  constexpr int VOCAB_SIZE = 4096;
+  constexpr int VOCAB_SIZE = 512;
 
   std::cout << "=== dad-gpt prepare ===\n\n";
 

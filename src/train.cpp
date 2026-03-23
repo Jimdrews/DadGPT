@@ -53,7 +53,7 @@ void run_training(const TrainConfig& tc) {
   // Initialize optimizer — m and v on GPU
   Adam opt;
   opt.max_lr = 3e-4f;
-  opt.warmup_steps = 100;
+  opt.warmup_steps = 500;
   opt.num_params = model.param_offsets.total;
   opt.m = gpu_alloc(model.param_offsets.total);
   opt.v = gpu_alloc(model.param_offsets.total);
