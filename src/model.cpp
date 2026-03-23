@@ -419,16 +419,22 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
                               d_out_h, seq_len, seq_len, dh);
     }
 
-    // Softmax backward on all heads at once
-    gpu_softmax_backward(model.grad_act(la.attn_scores), model.grad_act(la.attn_scores),
-                         model.act(la.attn_scores), c.n_heads * seq_len, seq_len);
+    // Softmax backward — need a temp buffer since din==dout would cause read/write aliasing
+    size_t scores_size = static_cast<size_t>(c.n_heads) * seq_len * seq_len;
+    float* d_prescores = gpu_alloc(scores_size);
+    gpu_zero(d_prescores, scores_size);
+    gpu_softmax_backward(d_prescores, model.grad_act(la.attn_scores), model.act(la.attn_scores),
+                         c.n_heads * seq_len, seq_len);
 
-    // Zero out causal mask positions in d_scores (not -1e9 — that's for forward only)
-    gpu_causal_mask_zero(model.grad_act(la.attn_scores), c.n_heads, seq_len);
-
-    // Scale backward
+    // Zero out causal mask positions and apply scale
+    gpu_causal_mask_zero(d_prescores, c.n_heads, seq_len);
     float attn_scale = 1.0f / std::sqrt(static_cast<float>(dh));
-    gpu_scale(model.grad_act(la.attn_scores), c.n_heads * seq_len * seq_len, attn_scale);
+    gpu_scale(d_prescores, static_cast<int>(scores_size), attn_scale);
+
+    // Copy back to grad_act for use by d_q and d_k computation
+    CUDA_CHECK(cudaMemcpy(model.grad_act(la.attn_scores), d_prescores, scores_size * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    gpu_free(d_prescores);
 
     // d_q_heads and d_k_heads from d_scores
     for (int head = 0; head < c.n_heads; ++head) {
