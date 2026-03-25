@@ -10,12 +10,12 @@
 
 TEST(Model, DefaultConfig) {
   ModelConfig config;
-  EXPECT_EQ(config.d_model, 256);
-  EXPECT_EQ(config.n_layers, 4);
-  EXPECT_EQ(config.n_heads, 4);
-  EXPECT_EQ(config.d_ff, 1024);
+  EXPECT_EQ(config.d_model, 512);
+  EXPECT_EQ(config.n_layers, 8);
+  EXPECT_EQ(config.n_heads, 8);
+  EXPECT_EQ(config.d_ff, 2048);
   EXPECT_EQ(config.ctx_len, 128);
-  EXPECT_EQ(config.vocab_size, 4096);
+  EXPECT_EQ(config.vocab_size, 512);
   EXPECT_EQ(config.d_head(), 64);
 }
 
@@ -24,8 +24,8 @@ TEST(Model, ParameterCount) {
   Model model{};
   model_alloc(model, config);
 
-  EXPECT_GT(model.param_offsets.total, 4000000u);
-  EXPECT_LT(model.param_offsets.total, 5000000u);
+  EXPECT_GT(model.param_offsets.total, 25000000u);
+  EXPECT_LT(model.param_offsets.total, 30000000u);
 
   model_free(model);
 }

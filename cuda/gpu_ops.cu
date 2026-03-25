@@ -114,8 +114,14 @@ __global__ void softmax_kernel(float* out, const float* in, int cols) {
   }
 }
 
+static int next_power_of_2(int n) {
+  int p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
 void gpu_softmax(float* out, const float* in, int rows, int cols) {
-  int threads = min(256, cols);
+  int threads = min(256, next_power_of_2(cols));
   softmax_kernel<<<rows, threads, threads * sizeof(float)>>>(out, in, cols);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -164,7 +170,7 @@ __global__ void layernorm_kernel(float* out, const float* in, const float* weigh
 
 void gpu_layernorm(float* out, const float* in, const float* weight, const float* bias, int rows,
                    int cols, float eps) {
-  int threads = min(256, cols);
+  int threads = min(256, next_power_of_2(cols));
   layernorm_kernel<<<rows, threads, threads * sizeof(float)>>>(out, in, weight, bias, cols, eps);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -396,7 +402,7 @@ __global__ void softmax_backward_kernel(float* din, const float* dout, const flo
 }
 
 void gpu_softmax_backward(float* din, const float* dout, const float* out, int rows, int cols) {
-  int threads = min(256, cols);
+  int threads = min(256, next_power_of_2(cols));
   softmax_backward_kernel<<<rows, threads, threads * sizeof(float)>>>(din, dout, out, cols);
   CUDA_CHECK(cudaGetLastError());
 }
