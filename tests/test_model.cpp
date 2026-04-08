@@ -118,6 +118,56 @@ TEST(Model, CausalMasking) {
   model_free(model);
 }
 
+TEST(Model, FusedBiasAdd) {
+  int rows = 4, cols = 3;
+  std::vector<float> h_data = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  std::vector<float> h_bias = {0.1f, 0.2f, 0.3f};
+
+  float* d_data = gpu_alloc(rows * cols);
+  float* d_bias = gpu_alloc(cols);
+  gpu_copy_to_device(d_data, h_data.data(), rows * cols);
+  gpu_copy_to_device(d_bias, h_bias.data(), cols);
+
+  gpu_add_bias(d_data, d_bias, rows, cols);
+
+  std::vector<float> result(rows * cols);
+  gpu_copy_to_host(result.data(), d_data, rows * cols);
+
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      float expected = h_data[r * cols + c] + h_bias[c];
+      EXPECT_NEAR(result[r * cols + c], expected, 1e-5)
+          << "Mismatch at (" << r << "," << c << ")";
+    }
+  }
+
+  gpu_free(d_data);
+  gpu_free(d_bias);
+}
+
+TEST(Model, ReduceRows) {
+  int rows = 4, cols = 3;
+  std::vector<float> h_data = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+
+  float* d_data = gpu_alloc(rows * cols);
+  float* d_dst = gpu_alloc(cols);
+  gpu_copy_to_device(d_data, h_data.data(), rows * cols);
+  gpu_zero(d_dst, cols);
+
+  gpu_reduce_rows(d_dst, d_data, rows, cols);
+
+  std::vector<float> result(cols);
+  gpu_copy_to_host(result.data(), d_dst, cols);
+
+  // Column sums: {1+4+7+10, 2+5+8+11, 3+6+9+12} = {22, 26, 30}
+  EXPECT_NEAR(result[0], 22.0f, 1e-5);
+  EXPECT_NEAR(result[1], 26.0f, 1e-5);
+  EXPECT_NEAR(result[2], 30.0f, 1e-5);
+
+  gpu_free(d_data);
+  gpu_free(d_dst);
+}
+
 TEST(Model, SaveLoadRoundTrip) {
   ModelConfig config;
   config.d_model = 32;

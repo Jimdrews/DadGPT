@@ -54,6 +54,10 @@ void gpu_gelu(float* out, const float* in, int size);
 void gpu_embedding_lookup(float* out, const uint16_t* tokens, const float* table, int num_tokens,
                           int d_model);
 void gpu_add_vectors(float* out, const float* a, const float* b, int size);
+// Add bias[cols] to each row of out[rows × cols]: out[r][c] += bias[c]
+void gpu_add_bias(float* out, const float* bias, int rows, int cols);
+// Accumulate rows into a bias gradient: dbias[c] += sum_r dout[r][c]
+void gpu_reduce_rows(float* dst, const float* src, int rows, int cols);
 
 // Returns scalar loss (on host). Writes dlogits on device.
 float gpu_cross_entropy_loss(float* dlogits, const float* logits, const uint16_t* targets,

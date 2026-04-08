@@ -222,37 +222,106 @@ void gpu_add_vectors(float* out, const float* a, const float* b, int size) {
   CUDA_CHECK(cudaGetLastError());
 }
 
-// Cross-entropy: compute softmax, loss, and dlogits in one kernel
+// Fused bias-add: out[r * cols + c] += bias[c]
+__global__ void add_bias_kernel(float* out, const float* bias, int rows, int cols) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * cols;
+  if (idx >= total) return;
+  int c = idx % cols;
+  out[idx] += bias[c];
+}
+
+void gpu_add_bias(float* out, const float* bias, int rows, int cols) {
+  int total = rows * cols;
+  int threads = 256;
+  int blocks = (total + threads - 1) / threads;
+  add_bias_kernel<<<blocks, threads>>>(out, bias, rows, cols);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// Reduce rows: dst[c] += sum_r src[r * cols + c]  (for bias gradient accumulation)
+__global__ void reduce_rows_kernel(float* dst, const float* src, int rows, int cols) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= cols) return;
+  float sum = 0.0f;
+  for (int r = 0; r < rows; ++r) {
+    sum += src[r * cols + c];
+  }
+  dst[c] += sum;
+}
+
+void gpu_reduce_rows(float* dst, const float* src, int rows, int cols) {
+  int threads = 256;
+  int blocks = (cols + threads - 1) / threads;
+  reduce_rows_kernel<<<blocks, threads>>>(dst, src, rows, cols);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// Cross-entropy: compute softmax, loss, and dlogits with parallel reduction
 __global__ void cross_entropy_kernel(float* dlogits, float* losses, const float* logits,
-                                     const uint16_t* targets, int vocab_size) {
+                                     const uint16_t* targets, int vocab_size, int total_rows) {
   int row = blockIdx.x;
   const float* row_in = logits + row * vocab_size;
   float* row_out = dlogits + row * vocab_size;
 
-  // Softmax
+  extern __shared__ float sdata[];
+
+  // Find max (parallel reduction)
   float max_val = -1e30f;
-  for (int v = 0; v < vocab_size; ++v) max_val = fmaxf(max_val, row_in[v]);
-
-  float sum = 0.0f;
-  for (int v = 0; v < vocab_size; ++v) {
-    row_out[v] = expf(row_in[v] - max_val);
-    sum += row_out[v];
+  for (int v = threadIdx.x; v < vocab_size; v += blockDim.x) {
+    max_val = fmaxf(max_val, row_in[v]);
   }
-  for (int v = 0; v < vocab_size; ++v) row_out[v] /= sum;
+  sdata[threadIdx.x] = max_val;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+    __syncthreads();
+  }
+  max_val = sdata[0];
 
-  // Loss
-  losses[row] = -logf(row_out[targets[row]] + 1e-10f);
+  // Exp and sum (parallel reduction)
+  float sum = 0.0f;
+  for (int v = threadIdx.x; v < vocab_size; v += blockDim.x) {
+    float val = expf(row_in[v] - max_val);
+    row_out[v] = val;
+    sum += val;
+  }
+  sdata[threadIdx.x] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    __syncthreads();
+  }
+  sum = sdata[0];
 
-  // Gradient: softmax - one_hot, averaged over seq_len
-  float inv_seq = 1.0f / (float)gridDim.x;
-  row_out[targets[row]] -= 1.0f;
-  for (int v = 0; v < vocab_size; ++v) row_out[v] *= inv_seq;
+  // Normalize
+  for (int v = threadIdx.x; v < vocab_size; v += blockDim.x) {
+    row_out[v] /= sum;
+  }
+  __syncthreads();
+
+  // Loss (single thread reads target probability)
+  if (threadIdx.x == 0) {
+    losses[row] = -logf(row_out[targets[row]] + 1e-10f);
+  }
+
+  // Gradient: softmax - one_hot, averaged over total rows
+  float inv_seq = 1.0f / (float)total_rows;
+  if (threadIdx.x == 0) {
+    row_out[targets[row]] -= 1.0f;
+  }
+  __syncthreads();
+  for (int v = threadIdx.x; v < vocab_size; v += blockDim.x) {
+    row_out[v] *= inv_seq;
+  }
 }
 
 float gpu_cross_entropy_loss(float* dlogits, const float* logits, const uint16_t* targets,
                              int seq_len, int vocab_size) {
+  int threads = min(256, next_power_of_2(vocab_size));
   float* d_losses = gpu_alloc(seq_len);
-  cross_entropy_kernel<<<seq_len, 1>>>(dlogits, d_losses, logits, targets, vocab_size);
+  cross_entropy_kernel<<<seq_len, threads, threads * sizeof(float)>>>(dlogits, d_losses, logits,
+                                                                      targets, vocab_size, seq_len);
   CUDA_CHECK(cudaGetLastError());
 
   std::vector<float> h_losses(seq_len);
@@ -416,33 +485,70 @@ __global__ void layernorm_backward_kernel(float* din, float* dweight, float* dbi
   float* din_row = din + row * cols;
   float n = (float)cols;
 
-  // Recompute forward stats
-  float mean = 0.0f, var = 0.0f;
-  for (int c = 0; c < cols; ++c) mean += in_row[c];
-  mean /= n;
-  for (int c = 0; c < cols; ++c) {
-    float d = in_row[c] - mean;
-    var += d * d;
+  extern __shared__ float sdata[];
+
+  // Recompute mean
+  float local_sum = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) local_sum += in_row[c];
+  sdata[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    __syncthreads();
   }
-  var /= n;
-  float inv_std = rsqrtf(var + eps);
+  float mean = sdata[0] / n;
+  __syncthreads();
+
+  // Recompute variance
+  float local_var = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    float d = in_row[c] - mean;
+    local_var += d * d;
+  }
+  sdata[threadIdx.x] = local_var;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    __syncthreads();
+  }
+  float inv_std = rsqrtf(sdata[0] / n + eps);
+  __syncthreads();
 
   // dweight, dbias (atomic since multiple rows contribute)
-  for (int c = 0; c < cols; ++c) {
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
     float norm_c = (in_row[c] - mean) * inv_std;
     atomicAdd(&dweight[c], dout_row[c] * norm_c);
     atomicAdd(&dbias[c], dout_row[c]);
   }
 
-  // din
-  float sum_dnorm = 0.0f, sum_dnorm_norm = 0.0f;
-  for (int c = 0; c < cols; ++c) {
+  // Reduce sum_dnorm and sum_dnorm_norm
+  float local_dnorm = 0.0f, local_dnorm_norm = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
     float dnorm_c = dout_row[c] * weight[c];
     float norm_c = (in_row[c] - mean) * inv_std;
-    sum_dnorm += dnorm_c;
-    sum_dnorm_norm += dnorm_c * norm_c;
+    local_dnorm += dnorm_c;
+    local_dnorm_norm += dnorm_c * norm_c;
   }
-  for (int c = 0; c < cols; ++c) {
+  sdata[threadIdx.x] = local_dnorm;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    __syncthreads();
+  }
+  float sum_dnorm = sdata[0];
+  __syncthreads();
+
+  sdata[threadIdx.x] = local_dnorm_norm;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    __syncthreads();
+  }
+  float sum_dnorm_norm = sdata[0];
+  __syncthreads();
+
+  // Compute din
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
     float dnorm_c = dout_row[c] * weight[c];
     float norm_c = (in_row[c] - mean) * inv_std;
     din_row[c] += inv_std * (dnorm_c - sum_dnorm / n - norm_c * sum_dnorm_norm / n);
@@ -451,7 +557,9 @@ __global__ void layernorm_backward_kernel(float* din, float* dweight, float* dbi
 
 void gpu_layernorm_backward(float* din, float* dweight, float* dbias, const float* dout,
                             const float* in, const float* weight, int rows, int cols, float eps) {
-  layernorm_backward_kernel<<<rows, 1>>>(din, dweight, dbias, dout, in, weight, cols, eps);
+  int threads = min(256, next_power_of_2(cols));
+  layernorm_backward_kernel<<<rows, threads, threads * sizeof(float)>>>(din, dweight, dbias, dout,
+                                                                        in, weight, cols, eps);
   CUDA_CHECK(cudaGetLastError());
 }
 

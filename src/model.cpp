@@ -156,6 +156,11 @@ void model_alloc(Model& model, const ModelConfig& config) {
   model.grad_activations = gpu_alloc(model.act_offsets.total);
   model.d_tokens = gpu_alloc_u16(config.ctx_len);
 
+  // Pre-allocate temp buffer for backward attention (n_heads * ctx_len * ctx_len)
+  size_t scores_buf_size =
+      static_cast<size_t>(config.n_heads) * config.ctx_len * config.ctx_len;
+  model.temp_scores = gpu_alloc(scores_buf_size);
+
   gpu_zero(model.params, model.param_offsets.total);
   gpu_zero(model.activations, model.act_offsets.total);
   gpu_zero(model.gradients, model.param_offsets.total);
@@ -172,11 +177,13 @@ void model_free(Model& model) {
   gpu_free(model.activations);
   gpu_free(model.gradients);
   gpu_free(model.grad_activations);
+  gpu_free(model.temp_scores);
   gpu_free(model.d_tokens);
   model.params = nullptr;
   model.activations = nullptr;
   model.gradients = nullptr;
   model.grad_activations = nullptr;
+  model.temp_scores = nullptr;
   model.d_tokens = nullptr;
   model.cublas_handle = nullptr;
 }
@@ -217,11 +224,9 @@ void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
     gpu_matmul(h, model.act(la.k), model.act(la.ln1_out), model.param(lp.Wk), seq_len, d, d);
     gpu_matmul(h, model.act(la.v), model.act(la.ln1_out), model.param(lp.Wv), seq_len, d, d);
 
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.act(la.q) + s * d, model.act(la.q) + s * d, model.param(lp.bq), d);
-      gpu_add_vectors(model.act(la.k) + s * d, model.act(la.k) + s * d, model.param(lp.bk), d);
-      gpu_add_vectors(model.act(la.v) + s * d, model.act(la.v) + s * d, model.param(lp.bv), d);
-    }
+    gpu_add_bias(model.act(la.q), model.param(lp.bq), seq_len, d);
+    gpu_add_bias(model.act(la.k), model.param(lp.bk), seq_len, d);
+    gpu_add_bias(model.act(la.v), model.param(lp.bv), seq_len, d);
 
     // Multi-head attention using per-head contiguous layout
     int dh = c.d_head();
@@ -269,10 +274,7 @@ void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
     // Output projection
     gpu_matmul(h, model.act(la.attn_proj), model.act(la.attn_out), model.param(lp.Wo), seq_len, d,
                d);
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.act(la.attn_proj) + s * d, model.act(la.attn_proj) + s * d,
-                      model.param(lp.bo), d);
-    }
+    gpu_add_bias(model.act(la.attn_proj), model.param(lp.bo), seq_len, d);
 
     // Residual 1
     gpu_add_vectors(model.act(la.residual1), residual, model.act(la.attn_proj), seq_len * d);
@@ -284,19 +286,13 @@ void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
     // MLP
     gpu_matmul(h, model.act(la.fc1_out), model.act(la.ln2_out), model.param(lp.fc1_w), seq_len, d,
                c.d_ff);
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.act(la.fc1_out) + s * c.d_ff, model.act(la.fc1_out) + s * c.d_ff,
-                      model.param(lp.fc1_b), c.d_ff);
-    }
+    gpu_add_bias(model.act(la.fc1_out), model.param(lp.fc1_b), seq_len, c.d_ff);
 
     gpu_gelu(model.act(la.gelu_out), model.act(la.fc1_out), seq_len * c.d_ff);
 
     gpu_matmul(h, model.act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w), seq_len,
                c.d_ff, d);
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.act(la.fc2_out) + s * d, model.act(la.fc2_out) + s * d,
-                      model.param(lp.fc2_b), d);
-    }
+    gpu_add_bias(model.act(la.fc2_out), model.param(lp.fc2_b), seq_len, d);
 
     // Residual 2
     gpu_add_vectors(model.act(la.residual2), model.act(la.residual1), model.act(la.fc2_out),
@@ -346,10 +342,7 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
                     model.grad_act(la.residual2), seq_len * d);
 
     // fc2 bias backward
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.grad(lp.fc2_b), model.grad(lp.fc2_b),
-                      model.grad_act(la.fc2_out) + s * d, d);
-    }
+    gpu_reduce_rows(model.grad(lp.fc2_b), model.grad_act(la.fc2_out), seq_len, d);
 
     // fc2 matmul backward
     gpu_matmul_backward(h, model.grad_act(la.fc2_out), model.act(la.gelu_out),
@@ -361,10 +354,7 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
                       model.act(la.fc1_out), seq_len * c.d_ff);
 
     // fc1 bias backward
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.grad(lp.fc1_b), model.grad(lp.fc1_b),
-                      model.grad_act(la.fc1_out) + s * c.d_ff, c.d_ff);
-    }
+    gpu_reduce_rows(model.grad(lp.fc1_b), model.grad_act(la.fc1_out), seq_len, c.d_ff);
 
     // fc1 matmul backward
     gpu_matmul_backward(h, model.grad_act(la.fc1_out), model.act(la.ln2_out),
@@ -384,10 +374,7 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
                     model.grad_act(la.residual1), seq_len * d);
 
     // Output projection bias backward
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.grad(lp.bo), model.grad(lp.bo),
-                      model.grad_act(la.attn_proj) + s * d, d);
-    }
+    gpu_reduce_rows(model.grad(lp.bo), model.grad_act(la.attn_proj), seq_len, d);
 
     // Output projection matmul backward
     gpu_matmul_backward(h, model.grad_act(la.attn_proj), model.act(la.attn_out),
@@ -419,22 +406,20 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
                               d_out_h, seq_len, seq_len, dh);
     }
 
-    // Softmax backward — need a temp buffer since din==dout would cause read/write aliasing
+    // Softmax backward — use pre-allocated temp buffer to avoid read/write aliasing
     size_t scores_size = static_cast<size_t>(c.n_heads) * seq_len * seq_len;
-    float* d_prescores = gpu_alloc(scores_size);
-    gpu_zero(d_prescores, scores_size);
-    gpu_softmax_backward(d_prescores, model.grad_act(la.attn_scores), model.act(la.attn_scores),
-                         c.n_heads * seq_len, seq_len);
+    gpu_zero(model.temp_scores, scores_size);
+    gpu_softmax_backward(model.temp_scores, model.grad_act(la.attn_scores),
+                         model.act(la.attn_scores), c.n_heads * seq_len, seq_len);
 
     // Zero out causal mask positions and apply scale
-    gpu_causal_mask_zero(d_prescores, c.n_heads, seq_len);
+    gpu_causal_mask_zero(model.temp_scores, c.n_heads, seq_len);
     float attn_scale = 1.0f / std::sqrt(static_cast<float>(dh));
-    gpu_scale(d_prescores, static_cast<int>(scores_size), attn_scale);
+    gpu_scale(model.temp_scores, static_cast<int>(scores_size), attn_scale);
 
     // Copy back to grad_act for use by d_q and d_k computation
-    CUDA_CHECK(cudaMemcpy(model.grad_act(la.attn_scores), d_prescores, scores_size * sizeof(float),
-                          cudaMemcpyDeviceToDevice));
-    gpu_free(d_prescores);
+    CUDA_CHECK(cudaMemcpy(model.grad_act(la.attn_scores), model.temp_scores,
+                          scores_size * sizeof(float), cudaMemcpyDeviceToDevice));
 
     // d_q_heads and d_k_heads from d_scores
     for (int head = 0; head < c.n_heads; ++head) {
@@ -460,11 +445,9 @@ void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
     gpu_merge_heads(model.grad_act(la.v), model.grad_act(la.v_heads), seq_len, c.n_heads, dh);
 
     // Q/K/V bias backward
-    for (int s = 0; s < seq_len; ++s) {
-      gpu_add_vectors(model.grad(lp.bq), model.grad(lp.bq), model.grad_act(la.q) + s * d, d);
-      gpu_add_vectors(model.grad(lp.bk), model.grad(lp.bk), model.grad_act(la.k) + s * d, d);
-      gpu_add_vectors(model.grad(lp.bv), model.grad(lp.bv), model.grad_act(la.v) + s * d, d);
-    }
+    gpu_reduce_rows(model.grad(lp.bq), model.grad_act(la.q), seq_len, d);
+    gpu_reduce_rows(model.grad(lp.bk), model.grad_act(la.k), seq_len, d);
+    gpu_reduce_rows(model.grad(lp.bv), model.grad_act(la.v), seq_len, d);
 
     // Q/K/V matmul backward
     gpu_matmul_backward(h, model.grad_act(la.q), model.act(la.ln1_out), model.param(lp.Wq),

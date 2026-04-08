@@ -67,6 +67,7 @@ struct Model {
   float* activations = nullptr;
   float* gradients = nullptr;
   float* grad_activations = nullptr;
+  float* temp_scores = nullptr;  // pre-allocated temp buffer for backward attention
   uint16_t* d_tokens = nullptr;  // device buffer for input tokens
   ParameterOffsets param_offsets;
   ActivationOffsets act_offsets;
