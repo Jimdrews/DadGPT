@@ -22,7 +22,7 @@ std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>&
 
     // Forward pass on current sequence
     gpu_zero(model.activations, model.act_offsets.total);
-    model_forward(model, tokens.data(), seq_len);
+    model_forward(model, tokens.data(), 1, seq_len);
 
     // Copy last position's logits from GPU to host
     gpu_copy_to_host(h_logits.data(),

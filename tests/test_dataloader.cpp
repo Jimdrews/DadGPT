@@ -29,10 +29,9 @@ TEST(DataLoader, BatchShape) {
   EXPECT_TRUE(loader.has_next());
   auto batch = loader.next_batch();
 
-  ASSERT_EQ(batch.tokens.size(), 2);
-  ASSERT_EQ(batch.tokens[0].size(), 4);
-  ASSERT_EQ(batch.targets.size(), 2);
-  ASSERT_EQ(batch.targets[0].size(), 4);
+  // Flat: batch_size * seq_len = 2 * 4 = 8
+  ASSERT_EQ(batch.tokens.size(), 8);
+  ASSERT_EQ(batch.targets.size(), 8);
 
   std::remove(path.c_str());
 }
@@ -44,15 +43,15 @@ TEST(DataLoader, TargetsAreShiftedInputs) {
 
   auto batch = loader.next_batch();
 
-  // tokens[0] = [10, 20, 30, 40], targets[0] = [20, 30, 40, 50]
-  EXPECT_EQ(batch.tokens[0][0], 10);
-  EXPECT_EQ(batch.tokens[0][3], 40);
-  EXPECT_EQ(batch.targets[0][0], 20);
-  EXPECT_EQ(batch.targets[0][3], 50);
+  // tokens = [10, 20, 30, 40], targets = [20, 30, 40, 50]
+  EXPECT_EQ(batch.tokens[0], 10);
+  EXPECT_EQ(batch.tokens[3], 40);
+  EXPECT_EQ(batch.targets[0], 20);
+  EXPECT_EQ(batch.targets[3], 50);
 
-  // Verify shift: targets[i][j] == tokens[i][j+1] in the original data
+  // Verify shift: targets[j] == tokens[j] + 10 (because source is 10,20,30,...)
   for (int j = 0; j < 4; ++j) {
-    EXPECT_EQ(batch.targets[0][j], batch.tokens[0][j] + 10)
+    EXPECT_EQ(batch.targets[j], batch.tokens[j] + 10)
         << "Shift mismatch at position " << j;
   }
 

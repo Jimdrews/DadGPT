@@ -5,8 +5,8 @@
 #include <vector>
 
 struct Batch {
-  std::vector<std::vector<uint16_t>> tokens;   // [batch_size][seq_len]
-  std::vector<std::vector<uint16_t>> targets;  // [batch_size][seq_len]
+  std::vector<uint16_t> tokens;   // [batch_size * seq_len] flat contiguous
+  std::vector<uint16_t> targets;  // [batch_size * seq_len] flat contiguous
 };
 
 // Write a token stream to a binary file: uint64_t header + uint16_t[] data

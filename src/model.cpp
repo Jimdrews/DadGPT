@@ -56,6 +56,7 @@ ParameterOffsets compute_param_offsets(const ModelConfig& c) {
 ActivationOffsets compute_act_offsets(const ModelConfig& c) {
   ActivationOffsets a{};
   size_t offset = 0;
+  int B = c.batch_size;
 
   auto alloc = [&](size_t count) {
     size_t o = offset;
@@ -63,34 +64,36 @@ ActivationOffsets compute_act_offsets(const ModelConfig& c) {
     return o;
   };
 
-  size_t sd = static_cast<size_t>(c.ctx_len) * c.d_model;
+  // Most activations use B*S rows of D columns (flattened batch+seq)
+  size_t bsd = static_cast<size_t>(B) * c.ctx_len * c.d_model;
 
-  a.embedded = alloc(sd);
+  a.embedded = alloc(bsd);
 
   a.layers.resize(c.n_layers);
   for (int l = 0; l < c.n_layers; ++l) {
     auto& ly = a.layers[l];
-    ly.ln1_out = alloc(sd);
-    ly.q = alloc(sd);
-    ly.k = alloc(sd);
-    ly.v = alloc(sd);
-    ly.q_heads = alloc(sd);  // [n_heads × seq_len × d_head]
-    ly.k_heads = alloc(sd);
-    ly.v_heads = alloc(sd);
-    ly.attn_scores = alloc(static_cast<size_t>(c.n_heads) * c.ctx_len * c.ctx_len);
-    ly.attn_out_heads = alloc(sd);  // [n_heads × seq_len × d_head]
-    ly.attn_out = alloc(sd);
-    ly.attn_proj = alloc(sd);
-    ly.residual1 = alloc(sd);
-    ly.ln2_out = alloc(sd);
-    ly.fc1_out = alloc(static_cast<size_t>(c.ctx_len) * c.d_ff);
-    ly.gelu_out = alloc(static_cast<size_t>(c.ctx_len) * c.d_ff);
-    ly.fc2_out = alloc(sd);
-    ly.residual2 = alloc(sd);
+    ly.ln1_out = alloc(bsd);
+    ly.q = alloc(bsd);
+    ly.k = alloc(bsd);
+    ly.v = alloc(bsd);
+    ly.q_heads = alloc(bsd);  // [B*H, S, dh]
+    ly.k_heads = alloc(bsd);
+    ly.v_heads = alloc(bsd);
+    // Attention scores: [B*H, S, S]
+    ly.attn_scores = alloc(static_cast<size_t>(B) * c.n_heads * c.ctx_len * c.ctx_len);
+    ly.attn_out_heads = alloc(bsd);  // [B*H, S, dh]
+    ly.attn_out = alloc(bsd);
+    ly.attn_proj = alloc(bsd);
+    ly.residual1 = alloc(bsd);
+    ly.ln2_out = alloc(bsd);
+    ly.fc1_out = alloc(static_cast<size_t>(B) * c.ctx_len * c.d_ff);
+    ly.gelu_out = alloc(static_cast<size_t>(B) * c.ctx_len * c.d_ff);
+    ly.fc2_out = alloc(bsd);
+    ly.residual2 = alloc(bsd);
   }
 
-  a.lnf_out = alloc(sd);
-  a.logits = alloc(static_cast<size_t>(c.ctx_len) * c.vocab_size);
+  a.lnf_out = alloc(bsd);
+  a.logits = alloc(static_cast<size_t>(B) * c.ctx_len * c.vocab_size);
 
   a.total = offset;
   return a;
@@ -154,11 +157,11 @@ void model_alloc(Model& model, const ModelConfig& config) {
   model.activations = gpu_alloc(model.act_offsets.total);
   model.gradients = gpu_alloc(model.param_offsets.total);
   model.grad_activations = gpu_alloc(model.act_offsets.total);
-  model.d_tokens = gpu_alloc_u16(config.ctx_len);
+  model.d_tokens = gpu_alloc_u16(static_cast<size_t>(config.batch_size) * config.ctx_len);
 
-  // Pre-allocate temp buffer for backward attention (n_heads * ctx_len * ctx_len)
-  size_t scores_buf_size =
-      static_cast<size_t>(config.n_heads) * config.ctx_len * config.ctx_len;
+  // Pre-allocate temp buffer for backward attention (B * n_heads * ctx_len * ctx_len)
+  size_t scores_buf_size = static_cast<size_t>(config.batch_size) * config.n_heads *
+                           config.ctx_len * config.ctx_len;
   model.temp_scores = gpu_alloc(scores_buf_size);
 
   gpu_zero(model.params, model.param_offsets.total);
@@ -193,20 +196,20 @@ void model_zero_grad(Model& model) {
   gpu_zero(model.grad_activations, model.act_offsets.total);
 }
 
-void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
+void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq_len) {
   const auto& c = model.config;
   const auto& po = model.param_offsets;
   const auto& ao = model.act_offsets;
   auto h = model.cublas_handle;
   int d = c.d_model;
+  int BS = batch_size * seq_len;  // flattened batch*seq for row-independent ops
 
   // Copy tokens to device
-  gpu_copy_u16_to_device(model.d_tokens, tokens, seq_len);
+  gpu_copy_u16_to_device(model.d_tokens, tokens, BS);
 
-  // 1. Embedding + positional
-  gpu_embedding_lookup(model.act(ao.embedded), model.d_tokens, model.param(po.tok_emb), seq_len, d);
-  gpu_add_vectors(model.act(ao.embedded), model.act(ao.embedded), model.param(po.pos_emb),
-                  seq_len * d);
+  // 1. Embedding + positional (broadcast pos_emb across batch)
+  gpu_embedding_lookup(model.act(ao.embedded), model.d_tokens, model.param(po.tok_emb), BS, d);
+  gpu_add_bias(model.act(ao.embedded), model.param(po.pos_emb), batch_size, seq_len * d);
 
   float* residual = model.act(ao.embedded);
 
@@ -215,260 +218,240 @@ void model_forward(Model& model, const uint16_t* tokens, int seq_len) {
     const auto& lp = po.layers[l];
     const auto& la = ao.layers[l];
 
-    // LayerNorm 1
+    // LayerNorm 1 — BS rows of d columns
     gpu_layernorm(model.act(la.ln1_out), residual, model.param(lp.ln1_w), model.param(lp.ln1_b),
-                  seq_len, d);
+                  BS, d);
 
-    // Q, K, V projections + bias
-    gpu_matmul(h, model.act(la.q), model.act(la.ln1_out), model.param(lp.Wq), seq_len, d, d);
-    gpu_matmul(h, model.act(la.k), model.act(la.ln1_out), model.param(lp.Wk), seq_len, d, d);
-    gpu_matmul(h, model.act(la.v), model.act(la.ln1_out), model.param(lp.Wv), seq_len, d, d);
+    // Q, K, V projections + bias — [BS, d] × [d, d] = [BS, d]
+    gpu_matmul(h, model.act(la.q), model.act(la.ln1_out), model.param(lp.Wq), BS, d, d);
+    gpu_matmul(h, model.act(la.k), model.act(la.ln1_out), model.param(lp.Wk), BS, d, d);
+    gpu_matmul(h, model.act(la.v), model.act(la.ln1_out), model.param(lp.Wv), BS, d, d);
 
-    gpu_add_bias(model.act(la.q), model.param(lp.bq), seq_len, d);
-    gpu_add_bias(model.act(la.k), model.param(lp.bk), seq_len, d);
-    gpu_add_bias(model.act(la.v), model.param(lp.bv), seq_len, d);
+    gpu_add_bias(model.act(la.q), model.param(lp.bq), BS, d);
+    gpu_add_bias(model.act(la.k), model.param(lp.bk), BS, d);
+    gpu_add_bias(model.act(la.v), model.param(lp.bv), BS, d);
 
-    // Multi-head attention using per-head contiguous layout
+    // Multi-head attention
     int dh = c.d_head();
+    int BH = batch_size * c.n_heads;
 
-    // Split heads: [seq_len × d_model] → [n_heads × seq_len × d_head]
-    gpu_split_heads(model.act(la.q_heads), model.act(la.q), seq_len, c.n_heads, dh);
-    gpu_split_heads(model.act(la.k_heads), model.act(la.k), seq_len, c.n_heads, dh);
-    gpu_split_heads(model.act(la.v_heads), model.act(la.v), seq_len, c.n_heads, dh);
+    // Split heads: [B*S, D] → [B*H, S, dh]
+    gpu_split_heads(model.act(la.q_heads), model.act(la.q), batch_size, seq_len, c.n_heads, dh);
+    gpu_split_heads(model.act(la.k_heads), model.act(la.k), batch_size, seq_len, c.n_heads, dh);
+    gpu_split_heads(model.act(la.v_heads), model.act(la.v), batch_size, seq_len, c.n_heads, dh);
 
-    // Per-head attention: scores = Q_h × K_h^T / sqrt(d_head), then mask + softmax, then attn × V_h
-    for (int head = 0; head < c.n_heads; ++head) {
-      float* q_h = model.act(la.q_heads) + static_cast<size_t>(head) * seq_len * dh;
-      float* k_h = model.act(la.k_heads) + static_cast<size_t>(head) * seq_len * dh;
-      float* v_h = model.act(la.v_heads) + static_cast<size_t>(head) * seq_len * dh;
-      float* scores = model.act(la.attn_scores) + static_cast<size_t>(head) * seq_len * seq_len;
-      float* out_h = model.act(la.attn_out_heads) + static_cast<size_t>(head) * seq_len * dh;
+    // scores = Q × K^T / sqrt(d_head) — all B*H heads in one call
+    long long stride_qkv = static_cast<long long>(seq_len) * dh;
+    long long stride_scores = static_cast<long long>(seq_len) * seq_len;
+    gpu_matmul_strided_batched_bt(h, model.act(la.attn_scores), model.act(la.q_heads),
+                                  model.act(la.k_heads), seq_len, dh, seq_len, stride_qkv,
+                                  stride_qkv, stride_scores, BH);
 
-      // scores = Q_h × K_h^T  [seq_len × seq_len]
-      gpu_matmul_transposed_b(h, scores, q_h, k_h, seq_len, dh, seq_len);
+    // Scale by 1/sqrt(d_head)
+    float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+    gpu_scale(model.act(la.attn_scores), BH * seq_len * seq_len, scale);
 
-      // Scale by 1/sqrt(d_head)
-      float scale = 1.0f / std::sqrt(static_cast<float>(dh));
-      gpu_scale(scores, seq_len * seq_len, scale);
-    }
+    // Causal mask all B*H blocks
+    gpu_causal_mask(model.act(la.attn_scores), BH, seq_len);
 
-    // Causal mask all heads at once
-    gpu_causal_mask(model.act(la.attn_scores), c.n_heads, seq_len);
+    // Softmax: B*H*S rows of S cols
+    gpu_softmax(model.act(la.attn_scores), model.act(la.attn_scores), BH * seq_len, seq_len);
 
-    // Softmax per head (each head is seq_len rows of seq_len cols)
-    gpu_softmax(model.act(la.attn_scores), model.act(la.attn_scores), c.n_heads * seq_len,
-                seq_len);
+    // attn_out = scores × V — all B*H heads in one call
+    gpu_matmul_strided_batched(h, model.act(la.attn_out_heads), model.act(la.attn_scores),
+                               model.act(la.v_heads), seq_len, seq_len, dh, stride_scores,
+                               stride_qkv, stride_qkv, BH);
 
-    // attn_out = softmax_scores × V_h per head
-    for (int head = 0; head < c.n_heads; ++head) {
-      float* scores = model.act(la.attn_scores) + static_cast<size_t>(head) * seq_len * seq_len;
-      float* v_h = model.act(la.v_heads) + static_cast<size_t>(head) * seq_len * dh;
-      float* out_h = model.act(la.attn_out_heads) + static_cast<size_t>(head) * seq_len * dh;
+    // Merge heads: [B*H, S, dh] → [B*S, D]
+    gpu_merge_heads(model.act(la.attn_out), model.act(la.attn_out_heads), batch_size, seq_len,
+                    c.n_heads, dh);
 
-      gpu_matmul(h, out_h, scores, v_h, seq_len, seq_len, dh);
-    }
-
-    // Merge heads: [n_heads × seq_len × d_head] → [seq_len × d_model]
-    gpu_merge_heads(model.act(la.attn_out), model.act(la.attn_out_heads), seq_len, c.n_heads, dh);
-
-    // Output projection
-    gpu_matmul(h, model.act(la.attn_proj), model.act(la.attn_out), model.param(lp.Wo), seq_len, d,
-               d);
-    gpu_add_bias(model.act(la.attn_proj), model.param(lp.bo), seq_len, d);
+    // Output projection — [BS, d] × [d, d] = [BS, d]
+    gpu_matmul(h, model.act(la.attn_proj), model.act(la.attn_out), model.param(lp.Wo), BS, d, d);
+    gpu_add_bias(model.act(la.attn_proj), model.param(lp.bo), BS, d);
 
     // Residual 1
-    gpu_add_vectors(model.act(la.residual1), residual, model.act(la.attn_proj), seq_len * d);
+    gpu_add_vectors(model.act(la.residual1), residual, model.act(la.attn_proj), BS * d);
 
     // LayerNorm 2
     gpu_layernorm(model.act(la.ln2_out), model.act(la.residual1), model.param(lp.ln2_w),
-                  model.param(lp.ln2_b), seq_len, d);
+                  model.param(lp.ln2_b), BS, d);
 
     // MLP
-    gpu_matmul(h, model.act(la.fc1_out), model.act(la.ln2_out), model.param(lp.fc1_w), seq_len, d,
+    gpu_matmul(h, model.act(la.fc1_out), model.act(la.ln2_out), model.param(lp.fc1_w), BS, d,
                c.d_ff);
-    gpu_add_bias(model.act(la.fc1_out), model.param(lp.fc1_b), seq_len, c.d_ff);
+    gpu_add_bias(model.act(la.fc1_out), model.param(lp.fc1_b), BS, c.d_ff);
 
-    gpu_gelu(model.act(la.gelu_out), model.act(la.fc1_out), seq_len * c.d_ff);
+    gpu_gelu(model.act(la.gelu_out), model.act(la.fc1_out), BS * c.d_ff);
 
-    gpu_matmul(h, model.act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w), seq_len,
+    gpu_matmul(h, model.act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w), BS,
                c.d_ff, d);
-    gpu_add_bias(model.act(la.fc2_out), model.param(lp.fc2_b), seq_len, d);
+    gpu_add_bias(model.act(la.fc2_out), model.param(lp.fc2_b), BS, d);
 
     // Residual 2
     gpu_add_vectors(model.act(la.residual2), model.act(la.residual1), model.act(la.fc2_out),
-                    seq_len * d);
+                    BS * d);
 
     residual = model.act(la.residual2);
   }
 
   // 3. Final layernorm
   gpu_layernorm(model.act(ao.lnf_out), residual, model.param(po.lnf_w), model.param(po.lnf_b),
-                seq_len, d);
+                BS, d);
 
-  // 4. Logits (weight-tied)
+  // 4. Logits (weight-tied) — [BS, d] × [vocab, d]^T = [BS, vocab]
   gpu_matmul_transposed_b(h, model.act(ao.logits), model.act(ao.lnf_out), model.param(po.tok_emb),
-                          seq_len, d, c.vocab_size);
+                          BS, d, c.vocab_size);
 }
 
-void model_backward(Model& model, const uint16_t* tokens, int seq_len) {
+void model_backward(Model& model, const uint16_t* tokens, int batch_size, int seq_len) {
   const auto& c = model.config;
   const auto& po = model.param_offsets;
   const auto& ao = model.act_offsets;
   auto h = model.cublas_handle;
   int d = c.d_model;
+  int BS = batch_size * seq_len;
 
   // 4. Backward logits: logits = lnf_out × tok_emb^T
   gpu_matmul(h, model.grad_act(ao.lnf_out), model.grad_act(ao.logits), model.param(po.tok_emb),
-             seq_len, c.vocab_size, d);
-  // d_tok_emb += dlogits^T × lnf_out
+             BS, c.vocab_size, d);
   gpu_matmul_transposed_a(h, model.grad(po.tok_emb), model.grad_act(ao.logits),
-                          model.act(ao.lnf_out), c.vocab_size, seq_len, d);
+                          model.act(ao.lnf_out), c.vocab_size, BS, d);
 
   // 3. Backward final layernorm
   size_t lnf_in = (c.n_layers > 0) ? ao.layers[c.n_layers - 1].residual2 : ao.embedded;
   gpu_layernorm_backward(model.grad_act(lnf_in), model.grad(po.lnf_w), model.grad(po.lnf_b),
                          model.grad_act(ao.lnf_out), model.act(lnf_in), model.param(po.lnf_w),
-                         seq_len, d);
+                         BS, d);
 
   // 2. Backward transformer blocks
   for (int l = c.n_layers - 1; l >= 0; --l) {
     const auto& lp = po.layers[l];
     const auto& la = ao.layers[l];
+    int dh = c.d_head();
+    int BH = batch_size * c.n_heads;
 
     // Residual 2 backward
     gpu_add_vectors(model.grad_act(la.residual1), model.grad_act(la.residual1),
-                    model.grad_act(la.residual2), seq_len * d);
+                    model.grad_act(la.residual2), BS * d);
     gpu_add_vectors(model.grad_act(la.fc2_out), model.grad_act(la.fc2_out),
-                    model.grad_act(la.residual2), seq_len * d);
+                    model.grad_act(la.residual2), BS * d);
 
     // fc2 bias backward
-    gpu_reduce_rows(model.grad(lp.fc2_b), model.grad_act(la.fc2_out), seq_len, d);
+    gpu_reduce_rows(model.grad(lp.fc2_b), model.grad_act(la.fc2_out), BS, d);
 
     // fc2 matmul backward
     gpu_matmul_backward(h, model.grad_act(la.fc2_out), model.act(la.gelu_out),
                         model.param(lp.fc2_w), model.grad_act(la.gelu_out), model.grad(lp.fc2_w),
-                        seq_len, c.d_ff, d);
+                        BS, c.d_ff, d);
 
     // GELU backward
     gpu_gelu_backward(model.grad_act(la.fc1_out), model.grad_act(la.gelu_out),
-                      model.act(la.fc1_out), seq_len * c.d_ff);
+                      model.act(la.fc1_out), BS * c.d_ff);
 
     // fc1 bias backward
-    gpu_reduce_rows(model.grad(lp.fc1_b), model.grad_act(la.fc1_out), seq_len, c.d_ff);
+    gpu_reduce_rows(model.grad(lp.fc1_b), model.grad_act(la.fc1_out), BS, c.d_ff);
 
     // fc1 matmul backward
     gpu_matmul_backward(h, model.grad_act(la.fc1_out), model.act(la.ln2_out),
                         model.param(lp.fc1_w), model.grad_act(la.ln2_out), model.grad(lp.fc1_w),
-                        seq_len, d, c.d_ff);
+                        BS, d, c.d_ff);
 
     // Layernorm 2 backward
     gpu_layernorm_backward(model.grad_act(la.residual1), model.grad(lp.ln2_w),
                            model.grad(lp.ln2_b), model.grad_act(la.ln2_out),
-                           model.act(la.residual1), model.param(lp.ln2_w), seq_len, d);
+                           model.act(la.residual1), model.param(lp.ln2_w), BS, d);
 
     // Residual 1 backward
     size_t prev = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
     gpu_add_vectors(model.grad_act(prev), model.grad_act(prev), model.grad_act(la.residual1),
-                    seq_len * d);
+                    BS * d);
     gpu_add_vectors(model.grad_act(la.attn_proj), model.grad_act(la.attn_proj),
-                    model.grad_act(la.residual1), seq_len * d);
+                    model.grad_act(la.residual1), BS * d);
 
     // Output projection bias backward
-    gpu_reduce_rows(model.grad(lp.bo), model.grad_act(la.attn_proj), seq_len, d);
+    gpu_reduce_rows(model.grad(lp.bo), model.grad_act(la.attn_proj), BS, d);
 
     // Output projection matmul backward
     gpu_matmul_backward(h, model.grad_act(la.attn_proj), model.act(la.attn_out),
                         model.param(lp.Wo), model.grad_act(la.attn_out), model.grad(lp.Wo),
-                        seq_len, d, d);
+                        BS, d, d);
 
-    // Attention backward (per-head layout)
-    int dh = c.d_head();
+    // Attention backward — split to [B*H, S, dh]
+    gpu_split_heads(model.grad_act(la.attn_out_heads), model.grad_act(la.attn_out), batch_size,
+                    seq_len, c.n_heads, dh);
 
-    // d_attn_out is in [seq_len × d_model] — split to per-head
-    gpu_split_heads(model.grad_act(la.attn_out_heads), model.grad_act(la.attn_out), seq_len,
-                    c.n_heads, dh);
+    long long stride_qkv = static_cast<long long>(seq_len) * dh;
+    long long stride_scores = static_cast<long long>(seq_len) * seq_len;
 
-    for (int head = 0; head < c.n_heads; ++head) {
-      size_t h_off = static_cast<size_t>(head) * seq_len * dh;
-      size_t s_off = static_cast<size_t>(head) * seq_len * seq_len;
+    // d_scores = d_attn_out × V^T  (all B*H heads at once)
+    gpu_matmul_strided_batched_bt(h, model.grad_act(la.attn_scores),
+                                  model.grad_act(la.attn_out_heads), model.act(la.v_heads),
+                                  seq_len, dh, seq_len, stride_qkv, stride_qkv, stride_scores, BH);
 
-      float* d_out_h = model.grad_act(la.attn_out_heads) + h_off;
-      float* scores = model.act(la.attn_scores) + s_off;
-      float* v_h = model.act(la.v_heads) + h_off;
+    // d_V += scores^T × d_attn_out (all B*H heads, accumulate)
+    gpu_matmul_strided_batched_at(h, model.grad_act(la.v_heads), model.act(la.attn_scores),
+                                  model.grad_act(la.attn_out_heads), seq_len, seq_len, dh,
+                                  stride_scores, stride_qkv, stride_qkv, BH);
 
-      // d_scores += d_out_h × V_h^T
-      float* d_scores_h = model.grad_act(la.attn_scores) + s_off;
-      gpu_matmul_transposed_b(model.cublas_handle, d_scores_h, d_out_h, v_h, seq_len, dh,
-                              seq_len);
-
-      // d_v_h += scores^T × d_out_h  (scores is [S×S], d_out_h is [S×dh], result is [S×dh])
-      gpu_matmul_transposed_a(model.cublas_handle, model.grad_act(la.v_heads) + h_off, scores,
-                              d_out_h, seq_len, seq_len, dh);
-    }
-
-    // Softmax backward — use pre-allocated temp buffer to avoid read/write aliasing
-    size_t scores_size = static_cast<size_t>(c.n_heads) * seq_len * seq_len;
+    // Softmax backward — use pre-allocated temp buffer
+    size_t scores_size = static_cast<size_t>(BH) * seq_len * seq_len;
     gpu_zero(model.temp_scores, scores_size);
     gpu_softmax_backward(model.temp_scores, model.grad_act(la.attn_scores),
-                         model.act(la.attn_scores), c.n_heads * seq_len, seq_len);
+                         model.act(la.attn_scores), BH * seq_len, seq_len);
 
     // Zero out causal mask positions and apply scale
-    gpu_causal_mask_zero(model.temp_scores, c.n_heads, seq_len);
+    gpu_causal_mask_zero(model.temp_scores, BH, seq_len);
     float attn_scale = 1.0f / std::sqrt(static_cast<float>(dh));
     gpu_scale(model.temp_scores, static_cast<int>(scores_size), attn_scale);
 
-    // Copy back to grad_act for use by d_q and d_k computation
+    // Copy back to grad_act
     CUDA_CHECK(cudaMemcpy(model.grad_act(la.attn_scores), model.temp_scores,
                           scores_size * sizeof(float), cudaMemcpyDeviceToDevice));
 
-    // d_q_heads and d_k_heads from d_scores
-    for (int head = 0; head < c.n_heads; ++head) {
-      size_t h_off = static_cast<size_t>(head) * seq_len * dh;
-      size_t s_off = static_cast<size_t>(head) * seq_len * seq_len;
+    // d_Q = d_scores × K  (all B*H heads)
+    gpu_matmul_strided_batched(h, model.grad_act(la.q_heads), model.grad_act(la.attn_scores),
+                               model.act(la.k_heads), seq_len, seq_len, dh, stride_scores,
+                               stride_qkv, stride_qkv, BH);
 
-      float* d_scores_h = model.grad_act(la.attn_scores) + s_off;
-      float* k_h = model.act(la.k_heads) + h_off;
-      float* q_h = model.act(la.q_heads) + h_off;
+    // d_K += d_scores^T × Q (all B*H heads, accumulate)
+    gpu_matmul_strided_batched_at(h, model.grad_act(la.k_heads), model.grad_act(la.attn_scores),
+                                  model.act(la.q_heads), seq_len, seq_len, dh, stride_scores,
+                                  stride_qkv, stride_qkv, BH);
 
-      // d_q_h += d_scores × K_h
-      gpu_matmul(model.cublas_handle, model.grad_act(la.q_heads) + h_off, d_scores_h, k_h,
-                 seq_len, seq_len, dh);
-
-      // d_k_h += d_scores^T × Q_h  (d_scores is [S×S], Q_h is [S×dh], result is [S×dh])
-      gpu_matmul_transposed_a(model.cublas_handle, model.grad_act(la.k_heads) + h_off, d_scores_h,
-                              q_h, seq_len, seq_len, dh);
-    }
-
-    // Merge head gradients back to [seq_len × d_model]
-    gpu_merge_heads(model.grad_act(la.q), model.grad_act(la.q_heads), seq_len, c.n_heads, dh);
-    gpu_merge_heads(model.grad_act(la.k), model.grad_act(la.k_heads), seq_len, c.n_heads, dh);
-    gpu_merge_heads(model.grad_act(la.v), model.grad_act(la.v_heads), seq_len, c.n_heads, dh);
+    // Merge head gradients: [B*H, S, dh] → [B*S, D]
+    gpu_merge_heads(model.grad_act(la.q), model.grad_act(la.q_heads), batch_size, seq_len,
+                    c.n_heads, dh);
+    gpu_merge_heads(model.grad_act(la.k), model.grad_act(la.k_heads), batch_size, seq_len,
+                    c.n_heads, dh);
+    gpu_merge_heads(model.grad_act(la.v), model.grad_act(la.v_heads), batch_size, seq_len,
+                    c.n_heads, dh);
 
     // Q/K/V bias backward
-    gpu_reduce_rows(model.grad(lp.bq), model.grad_act(la.q), seq_len, d);
-    gpu_reduce_rows(model.grad(lp.bk), model.grad_act(la.k), seq_len, d);
-    gpu_reduce_rows(model.grad(lp.bv), model.grad_act(la.v), seq_len, d);
+    gpu_reduce_rows(model.grad(lp.bq), model.grad_act(la.q), BS, d);
+    gpu_reduce_rows(model.grad(lp.bk), model.grad_act(la.k), BS, d);
+    gpu_reduce_rows(model.grad(lp.bv), model.grad_act(la.v), BS, d);
 
     // Q/K/V matmul backward
     gpu_matmul_backward(h, model.grad_act(la.q), model.act(la.ln1_out), model.param(lp.Wq),
-                        model.grad_act(la.ln1_out), model.grad(lp.Wq), seq_len, d, d);
+                        model.grad_act(la.ln1_out), model.grad(lp.Wq), BS, d, d);
     gpu_matmul_backward(h, model.grad_act(la.k), model.act(la.ln1_out), model.param(lp.Wk),
-                        model.grad_act(la.ln1_out), model.grad(lp.Wk), seq_len, d, d);
+                        model.grad_act(la.ln1_out), model.grad(lp.Wk), BS, d, d);
     gpu_matmul_backward(h, model.grad_act(la.v), model.act(la.ln1_out), model.param(lp.Wv),
-                        model.grad_act(la.ln1_out), model.grad(lp.Wv), seq_len, d, d);
+                        model.grad_act(la.ln1_out), model.grad(lp.Wv), BS, d, d);
 
     // Layernorm 1 backward
     size_t ln1_in = (l > 0) ? ao.layers[l - 1].residual2 : ao.embedded;
     gpu_layernorm_backward(model.grad_act(ln1_in), model.grad(lp.ln1_w), model.grad(lp.ln1_b),
                            model.grad_act(la.ln1_out), model.act(ln1_in), model.param(lp.ln1_w),
-                           seq_len, d);
+                           BS, d);
   }
 
   // 1. Embedding backward
   gpu_embedding_backward(model.grad(po.tok_emb), model.grad_act(ao.embedded), model.d_tokens,
-                         seq_len, d);
-  gpu_add_vectors(model.grad(po.pos_emb), model.grad(po.pos_emb), model.grad_act(ao.embedded),
-                  seq_len * d);
+                         BS, d);
+  // Positional embedding gradient: accumulate across batch
+  gpu_reduce_rows(model.grad(po.pos_emb), model.grad_act(ao.embedded), batch_size, seq_len * d);
 }
 
 void model_save(const Model& model, const std::string& path) {

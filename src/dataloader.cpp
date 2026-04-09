@@ -87,13 +87,15 @@ bool DataLoader::has_next() const {
 
 Batch DataLoader::next_batch() {
   Batch batch;
-  batch.tokens.resize(batch_size_, std::vector<uint16_t>(seq_len_));
-  batch.targets.resize(batch_size_, std::vector<uint16_t>(seq_len_));
+  size_t total = static_cast<size_t>(batch_size_) * seq_len_;
+  batch.tokens.resize(total);
+  batch.targets.resize(total);
 
   for (int b = 0; b < batch_size_; ++b) {
+    size_t dst = static_cast<size_t>(b) * seq_len_;
     for (int s = 0; s < seq_len_; ++s) {
-      batch.tokens[b][s] = data_[cursor_ + s];
-      batch.targets[b][s] = data_[cursor_ + s + 1];
+      batch.tokens[dst + s] = data_[cursor_ + s];
+      batch.targets[dst + s] = data_[cursor_ + s + 1];
     }
     cursor_ += static_cast<size_t>(seq_len_);
   }

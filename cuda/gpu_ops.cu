@@ -69,6 +69,41 @@ void gpu_matmul_transposed_b(cublasHandle_t handle, float* out, const float* a, 
                            out, N));
 }
 
+// --- Batched strided cuBLAS ---
+
+// Row-major C[i] = A[i] × B[i]^T, batch_count matrices
+void gpu_matmul_strided_batched_bt(cublasHandle_t handle, float* out, const float* a,
+                                   const float* b, int M, int K, int N,
+                                   long long strideA, long long strideB, long long strideC,
+                                   int batch_count) {
+  float alpha = 1.0f, beta = 0.0f;
+  CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K,
+                                         strideB, a, K, strideA, &beta, out, N, strideC,
+                                         batch_count));
+}
+
+// Row-major C[i] = A[i] × B[i], batch_count matrices
+void gpu_matmul_strided_batched(cublasHandle_t handle, float* out, const float* a,
+                                const float* b, int M, int K, int N,
+                                long long strideA, long long strideB, long long strideC,
+                                int batch_count) {
+  float alpha = 1.0f, beta = 0.0f;
+  CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N,
+                                         strideB, a, K, strideA, &beta, out, N, strideC,
+                                         batch_count));
+}
+
+// Row-major C[i] += A[i]^T × B[i] (accumulate), A is (K×M), B is (K×N), C is (M×N)
+void gpu_matmul_strided_batched_at(cublasHandle_t handle, float* out, const float* a,
+                                   const float* b, int M, int K, int N,
+                                   long long strideA, long long strideB, long long strideC,
+                                   int batch_count) {
+  float alpha = 1.0f, beta = 1.0f;  // beta=1 for accumulate
+  CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N,
+                                         strideB, a, M, strideA, &beta, out, N, strideC,
+                                         batch_count));
+}
+
 // ============================================================================
 // Forward kernels
 // ============================================================================
@@ -337,47 +372,53 @@ float gpu_cross_entropy_loss(float* dlogits, const float* logits, const uint16_t
 // Attention helpers
 // ============================================================================
 
-// [seq_len × d_model] → [n_heads × seq_len × d_head]
-// in[s][h*dh + x] → out[h][s][x]
-__global__ void split_heads_kernel(float* out, const float* in, int seq_len, int n_heads,
-                                   int d_head) {
+// [B*S, D] → [B*H, S, dh]
+// in[(b*S + s)*D + h*dh + x] → out[(b*H + h)*S*dh + s*dh + x]
+__global__ void split_heads_kernel(float* out, const float* in, int batch_size, int seq_len,
+                                   int n_heads, int d_head) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = n_heads * seq_len * d_head;
+  int total = batch_size * n_heads * seq_len * d_head;
   if (idx >= total) return;
   int x = idx % d_head;
   int s = (idx / d_head) % seq_len;
-  int h = idx / (d_head * seq_len);
+  int h = (idx / (d_head * seq_len)) % n_heads;
+  int b = idx / (d_head * seq_len * n_heads);
   int d_model = n_heads * d_head;
-  out[h * seq_len * d_head + s * d_head + x] = in[s * d_model + h * d_head + x];
+  out[(b * n_heads + h) * seq_len * d_head + s * d_head + x] =
+      in[(b * seq_len + s) * d_model + h * d_head + x];
 }
 
-void gpu_split_heads(float* out, const float* in, int seq_len, int n_heads, int d_head) {
-  int total = n_heads * seq_len * d_head;
+void gpu_split_heads(float* out, const float* in, int batch_size, int seq_len, int n_heads,
+                     int d_head) {
+  int total = batch_size * n_heads * seq_len * d_head;
   int threads = 256;
   int blocks = (total + threads - 1) / threads;
-  split_heads_kernel<<<blocks, threads>>>(out, in, seq_len, n_heads, d_head);
+  split_heads_kernel<<<blocks, threads>>>(out, in, batch_size, seq_len, n_heads, d_head);
   CUDA_CHECK(cudaGetLastError());
 }
 
-// [n_heads × seq_len × d_head] → [seq_len × d_model]
-// in[h][s][x] → out[s][h*dh + x]
-__global__ void merge_heads_kernel(float* out, const float* in, int seq_len, int n_heads,
-                                   int d_head) {
+// [B*H, S, dh] → [B*S, D]
+// in[(b*H + h)*S*dh + s*dh + x] → out[(b*S + s)*D + h*dh + x]
+__global__ void merge_heads_kernel(float* out, const float* in, int batch_size, int seq_len,
+                                   int n_heads, int d_head) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = n_heads * seq_len * d_head;
+  int total = batch_size * n_heads * seq_len * d_head;
   if (idx >= total) return;
   int x = idx % d_head;
   int s = (idx / d_head) % seq_len;
-  int h = idx / (d_head * seq_len);
+  int h = (idx / (d_head * seq_len)) % n_heads;
+  int b = idx / (d_head * seq_len * n_heads);
   int d_model = n_heads * d_head;
-  out[s * d_model + h * d_head + x] = in[h * seq_len * d_head + s * d_head + x];
+  out[(b * seq_len + s) * d_model + h * d_head + x] =
+      in[(b * n_heads + h) * seq_len * d_head + s * d_head + x];
 }
 
-void gpu_merge_heads(float* out, const float* in, int seq_len, int n_heads, int d_head) {
-  int total = n_heads * seq_len * d_head;
+void gpu_merge_heads(float* out, const float* in, int batch_size, int seq_len, int n_heads,
+                     int d_head) {
+  int total = batch_size * n_heads * seq_len * d_head;
   int threads = 256;
   int blocks = (total + threads - 1) / threads;
-  merge_heads_kernel<<<blocks, threads>>>(out, in, seq_len, n_heads, d_head);
+  merge_heads_kernel<<<blocks, threads>>>(out, in, batch_size, seq_len, n_heads, d_head);
   CUDA_CHECK(cudaGetLastError());
 }
 

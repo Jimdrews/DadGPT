@@ -74,15 +74,34 @@ void gpu_gelu_backward(float* din, const float* dout, const float* in, int size)
 void gpu_embedding_backward(float* dtable, const float* dout, const uint16_t* tokens,
                             int num_tokens, int d_model);
 
+// --- Batched strided cuBLAS ---
+// C[i] = A[i] × B[i]^T for i in [0, batch_count), each A is (M×K), B is (N×K), C is (M×N)
+void gpu_matmul_strided_batched_bt(cublasHandle_t handle, float* out, const float* a,
+                                   const float* b, int M, int K, int N,
+                                   long long strideA, long long strideB, long long strideC,
+                                   int batch_count);
+// C[i] = A[i] × B[i] for i in [0, batch_count), each A is (M×K), B is (K×N), C is (M×N)
+void gpu_matmul_strided_batched(cublasHandle_t handle, float* out, const float* a,
+                                const float* b, int M, int K, int N,
+                                long long strideA, long long strideB, long long strideC,
+                                int batch_count);
+// C[i] += A[i]^T × B[i] (accumulate), each A is (K×M), B is (K×N), C is (M×N)
+void gpu_matmul_strided_batched_at(cublasHandle_t handle, float* out, const float* a,
+                                   const float* b, int M, int K, int N,
+                                   long long strideA, long long strideB, long long strideC,
+                                   int batch_count);
+
 // --- Attention helpers ---
-// Reshape [seq_len × d_model] → [n_heads × seq_len × d_head] (split heads)
-void gpu_split_heads(float* out, const float* in, int seq_len, int n_heads, int d_head);
-// Reshape [n_heads × seq_len × d_head] → [seq_len × d_model] (merge heads)
-void gpu_merge_heads(float* out, const float* in, int seq_len, int n_heads, int d_head);
-// Apply causal mask: set scores[i][j] = -1e9 where j > i (forward pass)
-void gpu_causal_mask(float* scores, int n_heads, int seq_len);
-// Zero out causal mask positions: set grads[i][j] = 0 where j > i (backward pass)
-void gpu_causal_mask_zero(float* grads, int n_heads, int seq_len);
+// Reshape [B*S, D] → [B*H, S, dh] (split heads with batch)
+void gpu_split_heads(float* out, const float* in, int batch_size, int seq_len, int n_heads,
+                     int d_head);
+// Reshape [B*H, S, dh] → [B*S, D] (merge heads with batch)
+void gpu_merge_heads(float* out, const float* in, int batch_size, int seq_len, int n_heads,
+                     int d_head);
+// Apply causal mask: set scores[i][j] = -1e9 where j > i (per S×S block in B*H blocks)
+void gpu_causal_mask(float* scores, int num_blocks, int seq_len);
+// Zero out causal mask positions: set grads[i][j] = 0 where j > i (per S×S block)
+void gpu_causal_mask_zero(float* grads, int num_blocks, int seq_len);
 // Scale all elements: data[i] *= scale
 void gpu_scale(float* data, int size, float scale);
 

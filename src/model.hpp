@@ -14,6 +14,7 @@ struct ModelConfig {
   int d_ff = 2048;
   int ctx_len = 128;
   int vocab_size = 512;
+  int batch_size = 1;  // activation buffers sized for this batch size
 
   int d_head() const { return d_model / n_heads; }
 };
@@ -84,11 +85,11 @@ struct Model {
 void model_alloc(Model& model, const ModelConfig& config);
 void model_free(Model& model);
 
-// Forward pass: tokens[seq_len] → logits stored in model.activations at act_offsets.logits
-void model_forward(Model& model, const uint16_t* tokens, int seq_len);
+// Forward pass: tokens[batch_size * seq_len] → logits in activations at act_offsets.logits
+void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq_len);
 
 // Backward pass: compute gradients for all parameters (call after forward + loss)
-void model_backward(Model& model, const uint16_t* tokens, int seq_len);
+void model_backward(Model& model, const uint16_t* tokens, int batch_size, int seq_len);
 
 // Zero all gradients
 void model_zero_grad(Model& model);

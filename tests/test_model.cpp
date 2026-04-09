@@ -68,7 +68,7 @@ TEST(Model, ForwardPassOutputShape) {
   uint16_t tokens[] = {4, 5, 6, 7, 8};
   int seq_len = 5;
 
-  model_forward(model, tokens, seq_len);
+  model_forward(model, tokens, 1, seq_len);
 
   int logit_count = seq_len * config.vocab_size;
   std::vector<float> h_logits(logit_count);
@@ -103,11 +103,11 @@ TEST(Model, CausalMasking) {
 
   int logit_count = 3 * config.vocab_size;
 
-  model_forward(model, tokens1, 5);
+  model_forward(model, tokens1, 1, 5);
   std::vector<float> logits1(logit_count);
   gpu_copy_to_host(logits1.data(), model.act(model.act_offsets.logits), logit_count);
 
-  model_forward(model, tokens2, 5);
+  model_forward(model, tokens2, 1, 5);
   std::vector<float> logits2(logit_count);
   gpu_copy_to_host(logits2.data(), model.act(model.act_offsets.logits), logit_count);
 

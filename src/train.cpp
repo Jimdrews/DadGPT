@@ -37,6 +37,7 @@ void run_training(const TrainConfig& tc) {
   // Initialize model
   ModelConfig mc;
   mc.ctx_len = tc.seq_len;
+  mc.batch_size = tc.batch_size;
   Model model{};
 
   if (!resume_path.empty()) {
@@ -67,8 +68,9 @@ void run_training(const TrainConfig& tc) {
                            val_loader.num_tokens());
   std::cout << std::format("Batch size: {}, Seq len: {}\n\n", tc.batch_size, tc.seq_len);
 
-  // Device buffer for targets
-  uint16_t* d_targets = gpu_alloc_u16(tc.seq_len);
+  // Device buffer for targets (batch_size * seq_len)
+  size_t batch_tokens = static_cast<size_t>(tc.batch_size) * tc.seq_len;
+  uint16_t* d_targets = gpu_alloc_u16(batch_tokens);
 
   size_t tokens_per_batch =
       static_cast<size_t>(tc.batch_size) * static_cast<size_t>(tc.seq_len + 1);
@@ -86,31 +88,22 @@ void run_training(const TrainConfig& tc) {
       Batch batch = train_loader.next_batch();
 
       model_zero_grad(model);
-      float batch_loss = 0.0f;
+      gpu_zero(model.activations, model.act_offsets.total);
+      gpu_zero(model.grad_activations, model.act_offsets.total);
 
-      for (int b = 0; b < tc.batch_size; ++b) {
-        gpu_zero(model.activations, model.act_offsets.total);
-        gpu_zero(model.grad_activations, model.act_offsets.total);
+      // Single batched forward pass
+      model_forward(model, batch.tokens.data(), tc.batch_size, tc.seq_len);
 
-        // Forward pass (tokens copied to device inside model_forward)
-        model_forward(model, batch.tokens[b].data(), tc.seq_len);
+      // Copy all targets to device
+      gpu_copy_u16_to_device(d_targets, batch.targets.data(), batch_tokens);
 
-        // Copy targets to device for cross-entropy
-        gpu_copy_u16_to_device(d_targets, batch.targets[b].data(), tc.seq_len);
+      // Loss + dlogits on GPU (averaged over B*S positions)
+      float batch_loss = gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
+                                                model.act(model.act_offsets.logits), d_targets,
+                                                static_cast<int>(batch_tokens), mc.vocab_size);
 
-        // Loss + dlogits on GPU
-        float loss = gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
-                                            model.act(model.act_offsets.logits), d_targets,
-                                            tc.seq_len, mc.vocab_size);
-
-        model_backward(model, batch.tokens[b].data(), tc.seq_len);
-        batch_loss += loss;
-      }
-
-      // Average gradients
-      float inv_batch = 1.0f / static_cast<float>(tc.batch_size);
-      gpu_gradient_scale(model.gradients, model.param_offsets.total, inv_batch);
-      batch_loss *= inv_batch;
+      // Single batched backward pass
+      model_backward(model, batch.tokens.data(), tc.batch_size, tc.seq_len);
 
       // Gradient clipping on GPU
       float norm = gpu_gradient_norm(model.gradients, model.param_offsets.total);
@@ -135,7 +128,7 @@ void run_training(const TrainConfig& tc) {
       }
     }
 
-    // Validation
+    // Validation (batch_size=1 — reuse model with its current activation buffers)
     val_loader.reset();
     float val_loss = 0.0f;
     int val_steps = 0;
@@ -143,9 +136,9 @@ void run_training(const TrainConfig& tc) {
     while (val_loader.has_next()) {
       Batch vb = val_loader.next_batch();
       gpu_zero(model.activations, model.act_offsets.total);
-      model_forward(model, vb.tokens[0].data(), tc.seq_len);
+      model_forward(model, vb.tokens.data(), 1, tc.seq_len);
 
-      gpu_copy_u16_to_device(d_targets, vb.targets[0].data(), tc.seq_len);
+      gpu_copy_u16_to_device(d_targets, vb.targets.data(), tc.seq_len);
       val_loss += gpu_cross_entropy_loss(val_dlogits, model.act(model.act_offsets.logits),
                                          d_targets, tc.seq_len, mc.vocab_size);
       ++val_steps;
