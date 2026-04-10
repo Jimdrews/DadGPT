@@ -78,6 +78,12 @@ add_custom_target(memcheck
     VERBATIM
 )
 
-# GPU profiling (not a target — run manually):
-#   compute-sanitizer --tool memcheck ./build/default/src/dad-gpt
-#   compute-sanitizer --tool racecheck ./build/default/src/dad-gpt
+# gpu-memcheck: run compute-sanitizer memcheck on the test executable
+add_custom_target(gpu-memcheck
+    COMMAND compute-sanitizer --tool memcheck --leak-check full
+        $<TARGET_FILE:${PROJECT_NAME}-tests>
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Running compute-sanitizer memcheck on tests"
+    DEPENDS ${PROJECT_NAME}-tests
+    VERBATIM
+)

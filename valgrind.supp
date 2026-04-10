@@ -1,5 +1,6 @@
 # Valgrind suppression file for dad-gpt
-# Suppresses known false positives from CUDA runtime libraries
+# Suppresses known false positives from CUDA runtime libraries.
+# Application-level cudaMalloc leaks are NOT suppressed — those are real bugs.
 
 {
    cuda_runtime_init
@@ -29,9 +30,33 @@
    fun:*cudaGetDeviceCount*
 }
 
+# cuBLAS internal allocations during handle creation
 {
-   cuda_malloc_leak
+   cublas_create_leak
    Memcheck:Leak
    ...
-   fun:*cudaMalloc*
+   fun:*cublasCreate*
+}
+
+# cuRAND internal allocations
+{
+   curand_init_leak
+   Memcheck:Leak
+   ...
+   fun:*curand*
+}
+
+# CUDA lazy initialization (kernel launches, context setup)
+{
+   cuda_lazy_init
+   Memcheck:Leak
+   ...
+   fun:*cudaLaunchKernel*
+}
+
+{
+   cuda_stream_init
+   Memcheck:Leak
+   ...
+   fun:*cudaStreamSynchronize*
 }
