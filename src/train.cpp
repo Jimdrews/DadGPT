@@ -47,6 +47,8 @@ void run_training(const TrainConfig& tc) {
     model_alloc(model, mc);
   }
   mc = model.config;
+  model.training = true;
+  model.dropout_rate = tc.dropout_rate;
 
   std::cout << std::format("Model: {} params, d_model={}, n_layers={}, n_heads={}\n",
                            model.param_offsets.total, mc.d_model, mc.n_layers, mc.n_heads);
@@ -55,6 +57,7 @@ void run_training(const TrainConfig& tc) {
   Adam opt;
   opt.max_lr = 3e-4f;
   opt.warmup_steps = 500;
+  opt.weight_decay = tc.weight_decay;
   opt.num_params = model.param_offsets.total;
   opt.m = gpu_alloc(model.param_offsets.total);
   opt.v = gpu_alloc(model.param_offsets.total);
@@ -85,25 +88,37 @@ void run_training(const TrainConfig& tc) {
     int epoch_steps = 0;
 
     while (train_loader.has_next()) {
-      Batch batch = train_loader.next_batch();
-
       model_zero_grad(model);
-      gpu_zero(model.activations, model.act_offsets.total);
-      gpu_zero(model.grad_activations, model.act_offsets.total);
+      float accum_loss = 0.0f;
 
-      // Single batched forward pass
-      model_forward(model, batch.tokens.data(), tc.batch_size, tc.seq_len);
+      for (int acc = 0; acc < tc.accumulation_steps && train_loader.has_next(); ++acc) {
+        Batch batch = train_loader.next_batch();
 
-      // Copy all targets to device
-      gpu_copy_u16_to_device(d_targets, batch.targets.data(), batch_tokens);
+        gpu_zero(model.activations, model.act_offsets.total);
+        gpu_zero(model.grad_activations, model.act_offsets.total);
 
-      // Loss + dlogits on GPU (averaged over B*S positions)
-      float batch_loss = gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
-                                                model.act(model.act_offsets.logits), d_targets,
-                                                static_cast<int>(batch_tokens), mc.vocab_size);
+        // Single batched forward pass
+        model_forward(model, batch.tokens.data(), tc.batch_size, tc.seq_len);
 
-      // Single batched backward pass
-      model_backward(model, batch.tokens.data(), tc.batch_size, tc.seq_len);
+        // Copy all targets to device
+        gpu_copy_u16_to_device(d_targets, batch.targets.data(), batch_tokens);
+
+        // Loss + dlogits on GPU (averaged over B*S positions)
+        float batch_loss = gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
+                                                  model.act(model.act_offsets.logits), d_targets,
+                                                  static_cast<int>(batch_tokens), mc.vocab_size);
+
+        // Backward pass (gradients accumulate across accumulation steps)
+        model_backward(model, batch.tokens.data(), tc.batch_size, tc.seq_len);
+        accum_loss += batch_loss;
+      }
+
+      // Scale gradients by accumulation steps
+      if (tc.accumulation_steps > 1) {
+        float inv_accum = 1.0f / static_cast<float>(tc.accumulation_steps);
+        gpu_gradient_scale(model.gradients, model.param_offsets.total, inv_accum);
+        accum_loss *= inv_accum;
+      }
 
       // Gradient clipping on GPU
       float norm = gpu_gradient_norm(model.gradients, model.param_offsets.total);
@@ -111,13 +126,14 @@ void run_training(const TrainConfig& tc) {
         gpu_gradient_scale(model.gradients, model.param_offsets.total, 1.0f / norm);
       }
 
-      // Adam step on GPU
+      // AdamW step on GPU
       ++opt.step;
       float lr = adam_lr(opt);
-      gpu_adam_step(model.params, model.gradients, opt.m, opt.v, model.param_offsets.total, lr,
-                    opt.beta1, opt.beta2, opt.eps, opt.step);
+      gpu_adamw_step(model.params, model.gradients, opt.m, opt.v, model.decay_flags,
+                     model.param_offsets.total, lr, opt.beta1, opt.beta2, opt.eps,
+                     opt.weight_decay, opt.step);
 
-      epoch_loss += batch_loss;
+      epoch_loss += accum_loss;
       ++epoch_steps;
       ++global_step;
 
@@ -128,7 +144,8 @@ void run_training(const TrainConfig& tc) {
       }
     }
 
-    // Validation (batch_size=1 — reuse model with its current activation buffers)
+    // Validation (batch_size=1, dropout disabled)
+    model.training = false;
     val_loader.reset();
     float val_loss = 0.0f;
     int val_steps = 0;
@@ -144,6 +161,7 @@ void run_training(const TrainConfig& tc) {
       ++val_steps;
     }
     gpu_free(val_dlogits);
+    model.training = true;
 
     float avg_train = epoch_loss / static_cast<float>(std::max(epoch_steps, 1));
     float avg_val = val_loss / static_cast<float>(std::max(val_steps, 1));
@@ -152,7 +170,7 @@ void run_training(const TrainConfig& tc) {
 
     std::string ckpt_path =
         tc.data_dir + "/checkpoint_epoch_" + std::to_string(epoch + 1) + ".bin";
-    model_save(model, ckpt_path);
+    model_save_with_optimizer(model, opt, ckpt_path);
     std::cout << std::format("  Saved {}\n\n", ckpt_path);
   }
 

@@ -95,6 +95,7 @@ TEST(Backward, DebugGradientValues) {
 
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   uint16_t tokens[] = {4, 5, 6, 7};
   uint16_t targets[] = {5, 6, 7, 8};
@@ -149,6 +150,7 @@ TEST(Backward, BatchedGradientsMatchPerSample) {
 
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   uint16_t tokens_b0[] = {4, 5, 6, 7};
   uint16_t tokens_b1[] = {8, 9, 10, 11};
@@ -233,6 +235,7 @@ TEST(Backward, FullModelGradientCheck) {
 
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   uint16_t tokens[] = {4, 5, 6, 7};
   uint16_t targets[] = {5, 6, 7, 8};

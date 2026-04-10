@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "gpu_ops.cuh"
+#include "optimizer.hpp"
 
 namespace {
 
@@ -96,6 +97,24 @@ ActivationOffsets compute_act_offsets(const ModelConfig& c) {
   a.logits = alloc(static_cast<size_t>(B) * c.ctx_len * c.vocab_size);
 
   a.total = offset;
+
+  // Dropout mask offsets (uint8 buffer, separate from float activations)
+  size_t doff = 0;
+  auto dalloc = [&](size_t count) {
+    size_t o = doff;
+    doff += count;
+    return o;
+  };
+  a.drop_emb = dalloc(bsd);  // after embedding
+  a.drop_masks.resize(c.n_layers);
+  for (int l = 0; l < c.n_layers; ++l) {
+    auto& dm = a.drop_masks[l];
+    dm.attn_scores = dalloc(static_cast<size_t>(B) * c.n_heads * c.ctx_len * c.ctx_len);
+    dm.attn_proj = dalloc(bsd);
+    dm.mlp = dalloc(bsd);
+  }
+  a.drop_total = doff;
+
   return a;
 }
 
@@ -164,12 +183,46 @@ void model_alloc(Model& model, const ModelConfig& config) {
                            config.ctx_len * config.ctx_len;
   model.temp_scores = gpu_alloc(scores_buf_size);
 
+  // Dropout masks (uint8)
+  if (model.act_offsets.drop_total > 0) {
+    model.dropout_masks = gpu_alloc_u8(model.act_offsets.drop_total);
+  }
+
+  // Weight decay flags: 1 for weight matrices, 0 for biases and layernorm
+  {
+    std::vector<uint8_t> flags(model.param_offsets.total, 0);
+    const auto& po = model.param_offsets;
+    auto mark_decay = [&](size_t offset, size_t count) {
+      for (size_t i = 0; i < count; ++i) flags[offset + i] = 1;
+    };
+    // Token and positional embeddings get decay
+    mark_decay(po.tok_emb, static_cast<size_t>(config.vocab_size) * config.d_model);
+    mark_decay(po.pos_emb, static_cast<size_t>(config.ctx_len) * config.d_model);
+    for (int l = 0; l < config.n_layers; ++l) {
+      const auto& ly = po.layers[l];
+      // Weight matrices get decay; biases and layernorm params don't
+      mark_decay(ly.Wq, static_cast<size_t>(config.d_model) * config.d_model);
+      mark_decay(ly.Wk, static_cast<size_t>(config.d_model) * config.d_model);
+      mark_decay(ly.Wv, static_cast<size_t>(config.d_model) * config.d_model);
+      mark_decay(ly.Wo, static_cast<size_t>(config.d_model) * config.d_model);
+      mark_decay(ly.fc1_w, static_cast<size_t>(config.d_model) * config.d_ff);
+      mark_decay(ly.fc2_w, static_cast<size_t>(config.d_ff) * config.d_model);
+    }
+    model.decay_flags = gpu_alloc_u8(model.param_offsets.total);
+    CUDA_CHECK(cudaMemcpy(model.decay_flags, flags.data(), model.param_offsets.total,
+                          cudaMemcpyHostToDevice));
+  }
+
   gpu_zero(model.params, model.param_offsets.total);
   gpu_zero(model.activations, model.act_offsets.total);
   gpu_zero(model.gradients, model.param_offsets.total);
   gpu_zero(model.grad_activations, model.act_offsets.total);
 
   CUBLAS_CHECK(cublasCreate(&model.cublas_handle));
+
+  // Initialize cuRAND for dropout
+  gpu_dropout_init(42, static_cast<int>(
+      std::min(model.act_offsets.drop_total, static_cast<size_t>(256 * 1024))));
 
   init_weights(model);
 }
@@ -181,12 +234,17 @@ void model_free(Model& model) {
   gpu_free(model.gradients);
   gpu_free(model.grad_activations);
   gpu_free(model.temp_scores);
+  gpu_free(model.dropout_masks);
+  gpu_free(model.decay_flags);
   gpu_free(model.d_tokens);
+  gpu_dropout_free();
   model.params = nullptr;
   model.activations = nullptr;
   model.gradients = nullptr;
   model.grad_activations = nullptr;
   model.temp_scores = nullptr;
+  model.dropout_masks = nullptr;
+  model.decay_flags = nullptr;
   model.d_tokens = nullptr;
   model.cublas_handle = nullptr;
 }
@@ -210,6 +268,12 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
   // 1. Embedding + positional (broadcast pos_emb across batch)
   gpu_embedding_lookup(model.act(ao.embedded), model.d_tokens, model.param(po.tok_emb), BS, d);
   gpu_add_bias(model.act(ao.embedded), model.param(po.pos_emb), batch_size, seq_len * d);
+
+  // Dropout after embedding
+  if (model.training && model.dropout_rate > 0.0f) {
+    gpu_dropout_forward(model.act(ao.embedded), model.act(ao.embedded),
+                        model.drop_mask(ao.drop_emb), BS * d, model.dropout_rate);
+  }
 
   float* residual = model.act(ao.embedded);
 
@@ -257,6 +321,13 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
     // Softmax: B*H*S rows of S cols
     gpu_softmax(model.act(la.attn_scores), model.act(la.attn_scores), BH * seq_len, seq_len);
 
+    // Dropout after attention softmax
+    if (model.training && model.dropout_rate > 0.0f) {
+      gpu_dropout_forward(model.act(la.attn_scores), model.act(la.attn_scores),
+                          model.drop_mask(ao.drop_masks[l].attn_scores),
+                          BH * seq_len * seq_len, model.dropout_rate);
+    }
+
     // attn_out = scores × V — all B*H heads in one call
     gpu_matmul_strided_batched(h, model.act(la.attn_out_heads), model.act(la.attn_scores),
                                model.act(la.v_heads), seq_len, seq_len, dh, stride_scores,
@@ -269,6 +340,12 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
     // Output projection — [BS, d] × [d, d] = [BS, d]
     gpu_matmul(h, model.act(la.attn_proj), model.act(la.attn_out), model.param(lp.Wo), BS, d, d);
     gpu_add_bias(model.act(la.attn_proj), model.param(lp.bo), BS, d);
+
+    // Dropout after attention projection
+    if (model.training && model.dropout_rate > 0.0f) {
+      gpu_dropout_forward(model.act(la.attn_proj), model.act(la.attn_proj),
+                          model.drop_mask(ao.drop_masks[l].attn_proj), BS * d, model.dropout_rate);
+    }
 
     // Residual 1
     gpu_add_vectors(model.act(la.residual1), residual, model.act(la.attn_proj), BS * d);
@@ -287,6 +364,12 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
     gpu_matmul(h, model.act(la.fc2_out), model.act(la.gelu_out), model.param(lp.fc2_w), BS,
                c.d_ff, d);
     gpu_add_bias(model.act(la.fc2_out), model.param(lp.fc2_b), BS, d);
+
+    // Dropout after MLP
+    if (model.training && model.dropout_rate > 0.0f) {
+      gpu_dropout_forward(model.act(la.fc2_out), model.act(la.fc2_out),
+                          model.drop_mask(ao.drop_masks[l].mlp), BS * d, model.dropout_rate);
+    }
 
     // Residual 2
     gpu_add_vectors(model.act(la.residual2), model.act(la.residual1), model.act(la.fc2_out),
@@ -337,6 +420,12 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
     gpu_add_vectors(model.grad_act(la.fc2_out), model.grad_act(la.fc2_out),
                     model.grad_act(la.residual2), BS * d);
 
+    // Dropout backward (MLP)
+    if (model.training && model.dropout_rate > 0.0f) {
+      gpu_dropout_backward(model.grad_act(la.fc2_out),
+                           model.drop_mask(ao.drop_masks[l].mlp), BS * d, model.dropout_rate);
+    }
+
     // fc2 bias backward
     gpu_reduce_rows(model.grad(lp.fc2_b), model.grad_act(la.fc2_out), BS, d);
 
@@ -369,6 +458,12 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
     gpu_add_vectors(model.grad_act(la.attn_proj), model.grad_act(la.attn_proj),
                     model.grad_act(la.residual1), BS * d);
 
+    // Dropout backward (attention projection)
+    if (model.training && model.dropout_rate > 0.0f) {
+      gpu_dropout_backward(model.grad_act(la.attn_proj),
+                           model.drop_mask(ao.drop_masks[l].attn_proj), BS * d, model.dropout_rate);
+    }
+
     // Output projection bias backward
     gpu_reduce_rows(model.grad(lp.bo), model.grad_act(la.attn_proj), BS, d);
 
@@ -384,6 +479,14 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
     long long stride_qkv = static_cast<long long>(seq_len) * dh;
     long long stride_scores = static_cast<long long>(seq_len) * seq_len;
 
+    // Dropout backward (attention scores) — apply mask before d_scores computation
+    // Note: d_scores is about to be overwritten, but the dropout on attn_scores
+    // in forward means the V multiplication used masked scores. The gradient of
+    // attn_out = dropout(softmax(scores)) * V needs the dropout mask applied to
+    // the gradient flowing into softmax backward. We handle this by applying
+    // the mask to d_scores AFTER computing it (since d_scores = d_out * V^T uses
+    // the unmasked positions correctly, then we mask before softmax backward).
+
     // d_scores = d_attn_out × V^T  (all B*H heads at once)
     gpu_matmul_strided_batched_bt(h, model.grad_act(la.attn_scores),
                                   model.grad_act(la.attn_out_heads), model.act(la.v_heads),
@@ -393,6 +496,13 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
     gpu_matmul_strided_batched_at(h, model.grad_act(la.v_heads), model.act(la.attn_scores),
                                   model.grad_act(la.attn_out_heads), seq_len, seq_len, dh,
                                   stride_scores, stride_qkv, stride_qkv, BH);
+
+    // Dropout backward (attention scores)
+    if (model.training && model.dropout_rate > 0.0f) {
+      gpu_dropout_backward(model.grad_act(la.attn_scores),
+                           model.drop_mask(ao.drop_masks[l].attn_scores),
+                           BH * seq_len * seq_len, model.dropout_rate);
+    }
 
     // Softmax backward — use pre-allocated temp buffer
     size_t scores_size = static_cast<size_t>(BH) * seq_len * seq_len;
@@ -447,6 +557,12 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
                            BS, d);
   }
 
+  // Dropout backward (embedding)
+  if (model.training && model.dropout_rate > 0.0f) {
+    gpu_dropout_backward(model.grad_act(ao.embedded), model.drop_mask(ao.drop_emb), BS * d,
+                         model.dropout_rate);
+  }
+
   // 1. Embedding backward
   gpu_embedding_backward(model.grad(po.tok_emb), model.grad_act(ao.embedded), model.d_tokens,
                          BS, d);
@@ -487,4 +603,60 @@ void model_load(Model& model, const std::string& path) {
   f.read(reinterpret_cast<char*>(h_params.data()),
          static_cast<std::streamsize>(num_params * sizeof(float)));
   gpu_copy_to_device(model.params, h_params.data(), num_params);
+}
+
+void model_save_with_optimizer(const Model& model, const Adam& opt, const std::string& path) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("Cannot write " + path);
+
+  // Model config + params (same as model_save)
+  f.write(reinterpret_cast<const char*>(&model.config), sizeof(ModelConfig));
+  auto num_params = static_cast<uint64_t>(model.param_offsets.total);
+  f.write(reinterpret_cast<const char*>(&num_params), sizeof(num_params));
+  std::vector<float> h_params(num_params);
+  gpu_copy_to_host(h_params.data(), model.params, num_params);
+  f.write(reinterpret_cast<const char*>(h_params.data()),
+          static_cast<std::streamsize>(num_params * sizeof(float)));
+
+  // Optimizer state
+  uint8_t has_opt = 1;
+  f.write(reinterpret_cast<const char*>(&has_opt), 1);
+  f.write(reinterpret_cast<const char*>(&opt.step), sizeof(opt.step));
+  std::vector<float> h_m(num_params), h_v(num_params);
+  gpu_copy_to_host(h_m.data(), opt.m, num_params);
+  gpu_copy_to_host(h_v.data(), opt.v, num_params);
+  f.write(reinterpret_cast<const char*>(h_m.data()),
+          static_cast<std::streamsize>(num_params * sizeof(float)));
+  f.write(reinterpret_cast<const char*>(h_v.data()),
+          static_cast<std::streamsize>(num_params * sizeof(float)));
+}
+
+void model_load_with_optimizer(Model& model, Adam& opt, const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("Cannot read " + path);
+
+  ModelConfig config{};
+  f.read(reinterpret_cast<char*>(&config), sizeof(ModelConfig));
+  model_alloc(model, config);
+
+  uint64_t num_params = 0;
+  f.read(reinterpret_cast<char*>(&num_params), sizeof(num_params));
+  std::vector<float> h_params(num_params);
+  f.read(reinterpret_cast<char*>(h_params.data()),
+         static_cast<std::streamsize>(num_params * sizeof(float)));
+  gpu_copy_to_device(model.params, h_params.data(), num_params);
+
+  // Try to read optimizer state
+  uint8_t has_opt = 0;
+  f.read(reinterpret_cast<char*>(&has_opt), 1);
+  if (f && has_opt == 1) {
+    f.read(reinterpret_cast<char*>(&opt.step), sizeof(opt.step));
+    std::vector<float> h_m(num_params), h_v(num_params);
+    f.read(reinterpret_cast<char*>(h_m.data()),
+           static_cast<std::streamsize>(num_params * sizeof(float)));
+    f.read(reinterpret_cast<char*>(h_v.data()),
+           static_cast<std::streamsize>(num_params * sizeof(float)));
+    gpu_copy_to_device(opt.m, h_m.data(), num_params);
+    gpu_copy_to_device(opt.v, h_v.data(), num_params);
+  }
 }

@@ -29,6 +29,7 @@
 // --- Memory helpers ---
 float* gpu_alloc(size_t num_floats);
 uint16_t* gpu_alloc_u16(size_t count);
+uint8_t* gpu_alloc_u8(size_t count);
 void gpu_free(void* ptr);
 void gpu_copy_to_device(float* dst, const float* src, size_t count);
 void gpu_copy_to_host(float* dst, const float* src, size_t count);
@@ -105,7 +106,20 @@ void gpu_causal_mask_zero(float* grads, int num_blocks, int seq_len);
 // Scale all elements: data[i] *= scale
 void gpu_scale(float* data, int size, float scale);
 
+// --- Dropout kernels ---
+// Initialize cuRAND states (call once)
+void gpu_dropout_init(unsigned long long seed, int max_size);
+void gpu_dropout_free();
+// Forward: out = in * mask * scale, mask stored as uint8 (0 or 1)
+void gpu_dropout_forward(float* out, const float* in, uint8_t* mask, int size, float rate);
+// In-place backward: dout[i] *= mask[i] * scale
+void gpu_dropout_backward(float* dout, const uint8_t* mask, int size, float rate);
+
 // --- Optimizer kernels ---
+// AdamW step with decoupled weight decay. decay_flags[i]=1 means apply weight decay.
+void gpu_adamw_step(float* params, const float* grads, float* m, float* v,
+                    const uint8_t* decay_flags, size_t num_params, float lr, float beta1,
+                    float beta2, float eps, float weight_decay, int step);
 void gpu_adam_step(float* params, const float* grads, float* m, float* v, size_t num_params,
                   float lr, float beta1, float beta2, float eps, int step);
 float gpu_gradient_norm(const float* grads, size_t num_params);

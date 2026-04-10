@@ -145,6 +145,7 @@ void run_generate(const GenerateConfig& config) {
   // Load model
   Model model{};
   model_load(model, config.checkpoint_path);
+  model.training = false;
   std::cout << std::format("Loaded checkpoint: {}\n", config.checkpoint_path);
   std::cout << std::format("Temperature: {}, Top-k: {}\n\n", config.temperature, config.top_k);
 

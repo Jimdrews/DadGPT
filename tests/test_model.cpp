@@ -23,6 +23,7 @@ TEST(Model, ParameterCount) {
   ModelConfig config;
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   EXPECT_GT(model.param_offsets.total, 25000000u);
   EXPECT_LT(model.param_offsets.total, 30000000u);
@@ -34,6 +35,7 @@ TEST(Model, WeightInitNonZero) {
   ModelConfig config;
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   int emb_size = config.vocab_size * config.d_model;
   std::vector<float> h_emb(emb_size);
@@ -64,6 +66,7 @@ TEST(Model, ForwardPassOutputShape) {
 
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   uint16_t tokens[] = {4, 5, 6, 7, 8};
   int seq_len = 5;
@@ -97,6 +100,7 @@ TEST(Model, CausalMasking) {
 
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   uint16_t tokens1[] = {4, 5, 6, 10, 20};
   uint16_t tokens2[] = {4, 5, 6, 30, 40};
@@ -179,6 +183,7 @@ TEST(Model, SaveLoadRoundTrip) {
 
   Model model{};
   model_alloc(model, config);
+  model.training = false;
 
   std::string path = "/tmp/test_model.bin";
   model_save(model, path);

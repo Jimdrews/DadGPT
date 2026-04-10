@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <curand_kernel.h>
 #include <vector>
 
 // ============================================================================
@@ -17,6 +18,12 @@ float* gpu_alloc(size_t num_floats) {
 uint16_t* gpu_alloc_u16(size_t count) {
   uint16_t* ptr = nullptr;
   CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(uint16_t)));
+  return ptr;
+}
+
+uint8_t* gpu_alloc_u8(size_t count) {
+  uint8_t* ptr = nullptr;
+  CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(uint8_t)));
   return ptr;
 }
 
@@ -644,8 +651,106 @@ void gpu_embedding_backward(float* dtable, const float* dout, const uint16_t* to
 }
 
 // ============================================================================
+// Dropout kernels
+// ============================================================================
+
+static curandState* d_curand_states = nullptr;
+static int d_curand_max_size = 0;
+
+__global__ void curand_init_kernel(curandState* states, unsigned long long seed, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  curand_init(seed, i, 0, &states[i]);
+}
+
+void gpu_dropout_init(unsigned long long seed, int max_size) {
+  if (d_curand_states) gpu_free(d_curand_states);
+  CUDA_CHECK(cudaMalloc(&d_curand_states, max_size * sizeof(curandState)));
+  d_curand_max_size = max_size;
+  int threads = 256;
+  int blocks = (max_size + threads - 1) / threads;
+  curand_init_kernel<<<blocks, threads>>>(d_curand_states, seed, max_size);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void gpu_dropout_free() {
+  if (d_curand_states) {
+    gpu_free(d_curand_states);
+    d_curand_states = nullptr;
+    d_curand_max_size = 0;
+  }
+}
+
+__global__ void dropout_forward_kernel(float* out, const float* in, uint8_t* mask, int size,
+                                       float rate, curandState* states, int num_states) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= size) return;
+  float r = curand_uniform(&states[i % num_states]);
+  float scale = 1.0f / (1.0f - rate);
+  if (r < rate) {
+    mask[i] = 0;
+    out[i] = 0.0f;
+  } else {
+    mask[i] = 1;
+    out[i] = in[i] * scale;
+  }
+}
+
+void gpu_dropout_forward(float* out, const float* in, uint8_t* mask, int size, float rate) {
+  int threads = 256;
+  int blocks = (size + threads - 1) / threads;
+  dropout_forward_kernel<<<blocks, threads>>>(out, in, mask, size, rate, d_curand_states,
+                                              d_curand_max_size);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// In-place dropout backward: dout[i] *= mask[i] * scale (masks gradient at same positions)
+__global__ void dropout_backward_kernel(float* dout, const uint8_t* mask, int size, float rate) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= size) return;
+  float scale = 1.0f / (1.0f - rate);
+  dout[i] *= mask[i] * scale;
+}
+
+void gpu_dropout_backward(float* dout, const uint8_t* mask, int size, float rate) {
+  int threads = 256;
+  int blocks = (size + threads - 1) / threads;
+  dropout_backward_kernel<<<blocks, threads>>>(dout, mask, size, rate);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
 // Optimizer kernels
 // ============================================================================
+
+__global__ void adamw_kernel(float* params, const float* grads, float* m, float* v,
+                            const uint8_t* decay_flags, size_t num_params, float lr, float beta1,
+                            float beta2, float eps, float weight_decay, float bc1, float bc2) {
+  size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+  if (i >= num_params) return;
+  // Decoupled weight decay (before Adam update)
+  if (decay_flags[i]) {
+    params[i] -= lr * weight_decay * params[i];
+  }
+  float g = grads[i];
+  m[i] = beta1 * m[i] + (1.0f - beta1) * g;
+  v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
+  float m_hat = m[i] / bc1;
+  float v_hat = v[i] / bc2;
+  params[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
+void gpu_adamw_step(float* params, const float* grads, float* m, float* v,
+                    const uint8_t* decay_flags, size_t num_params, float lr, float beta1,
+                    float beta2, float eps, float weight_decay, int step) {
+  float bc1 = 1.0f - powf(beta1, (float)step);
+  float bc2 = 1.0f - powf(beta2, (float)step);
+  int threads = 256;
+  int blocks = (int)((num_params + threads - 1) / threads);
+  adamw_kernel<<<blocks, threads>>>(params, grads, m, v, decay_flags, num_params, lr, beta1, beta2,
+                                    eps, weight_decay, bc1, bc2);
+  CUDA_CHECK(cudaGetLastError());
+}
 
 __global__ void adam_kernel(float* params, const float* grads, float* m, float* v,
                            size_t num_params, float lr, float beta1, float beta2, float eps,

@@ -11,6 +11,7 @@ struct Adam {
   float beta2 = 0.999f;
   float eps = 1e-8f;
   float max_lr = 3e-4f;
+  float weight_decay = 0.1f;
   int warmup_steps = 100;
   int total_steps = 1;
 };

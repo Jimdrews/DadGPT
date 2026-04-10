@@ -113,6 +113,12 @@ int main(int argc, char* argv[]) {
         tc.data_dir = argv[++i];
       } else if (arg == "--batch" && i + 1 < argc) {
         tc.batch_size = std::stoi(argv[++i]);
+      } else if (arg == "--accum" && i + 1 < argc) {
+        tc.accumulation_steps = std::stoi(argv[++i]);
+      } else if (arg == "--dropout" && i + 1 < argc) {
+        tc.dropout_rate = std::stof(argv[++i]);
+      } else if (arg == "--wd" && i + 1 < argc) {
+        tc.weight_decay = std::stof(argv[++i]);
       }
     }
     run_training(tc);

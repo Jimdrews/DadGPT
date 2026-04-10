@@ -21,7 +21,14 @@ float adam_lr(const Adam& opt) {
   if (opt.step < opt.warmup_steps) {
     return opt.max_lr * static_cast<float>(opt.step) / static_cast<float>(opt.warmup_steps);
   }
-  return opt.max_lr;
+  // Cosine decay from max_lr to min_lr
+  float min_lr = opt.max_lr * 0.1f;
+  int decay_steps = opt.total_steps - opt.warmup_steps;
+  if (decay_steps <= 0) return opt.max_lr;
+  float progress =
+      static_cast<float>(opt.step - opt.warmup_steps) / static_cast<float>(decay_steps);
+  if (progress > 1.0f) progress = 1.0f;
+  return min_lr + 0.5f * (opt.max_lr - min_lr) * (1.0f + std::cos(M_PI * progress));
 }
 
 void adam_step(Adam& opt, float* params, const float* grads) {

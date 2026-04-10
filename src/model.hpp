@@ -54,6 +54,17 @@ struct ActivationOffsets {
     size_t fc2_out;              // [seq_len × d_model]
     size_t residual2;            // [seq_len × d_model]
   };
+
+  // Dropout mask offsets (uint8, separate buffer from float activations)
+  struct DropoutMasks {
+    size_t emb;          // after embedding
+    size_t attn_scores;  // after attention softmax
+    size_t attn_proj;    // after attention output projection
+    size_t mlp;          // after MLP fc2
+  };
+  std::vector<DropoutMasks> drop_masks;
+  size_t drop_emb;       // embedding dropout mask
+  size_t drop_total;     // total uint8 mask elements
   std::vector<LayerActivations> layers;
 
   size_t lnf_out;
@@ -63,13 +74,18 @@ struct ActivationOffsets {
 
 struct Model {
   ModelConfig config;
+  bool training = true;
+  float dropout_rate = 0.1f;
+
   // All pointers are GPU device memory
   float* params = nullptr;
   float* activations = nullptr;
   float* gradients = nullptr;
   float* grad_activations = nullptr;
   float* temp_scores = nullptr;  // pre-allocated temp buffer for backward attention
-  uint16_t* d_tokens = nullptr;  // device buffer for input tokens
+  uint8_t* dropout_masks = nullptr;
+  uint8_t* decay_flags = nullptr;  // per-param weight decay flags for AdamW
+  uint16_t* d_tokens = nullptr;    // device buffer for input tokens
   ParameterOffsets param_offsets;
   ActivationOffsets act_offsets;
   cublasHandle_t cublas_handle = nullptr;
@@ -79,6 +95,7 @@ struct Model {
   float* act(size_t offset) { return activations + offset; }
   float* grad(size_t offset) { return gradients + offset; }
   float* grad_act(size_t offset) { return grad_activations + offset; }
+  uint8_t* drop_mask(size_t offset) { return dropout_masks + offset; }
 };
 
 // Allocate and initialize model
@@ -97,3 +114,8 @@ void model_zero_grad(Model& model);
 // Save/load
 void model_save(const Model& model, const std::string& path);
 void model_load(Model& model, const std::string& path);
+
+// Save/load with optimizer state
+struct Adam;
+void model_save_with_optimizer(const Model& model, const Adam& opt, const std::string& path);
+void model_load_with_optimizer(Model& model, Adam& opt, const std::string& path);
