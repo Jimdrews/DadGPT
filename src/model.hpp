@@ -115,6 +115,25 @@ void model_zero_grad(Model& model);
 void model_save(const Model& model, const std::string& path);
 void model_load(Model& model, const std::string& path);
 
+// KV cache for autoregressive generation
+struct KVCache {
+  // Per-layer K and V: [n_heads, max_seq_len, d_head] each (GPU memory)
+  std::vector<float*> k_cache;  // one per layer
+  std::vector<float*> v_cache;  // one per layer
+  int length = 0;               // current number of cached positions
+  int max_len = 0;
+  int n_layers = 0;
+  int n_heads = 0;
+  int d_head = 0;
+};
+
+void kv_cache_alloc(KVCache& cache, const ModelConfig& config);
+void kv_cache_free(KVCache& cache);
+
+// Cached forward: processes one new position using the KV cache
+// tokens points to the single new token (on host), pos is the position index
+void model_forward_cached(Model& model, KVCache& cache, uint16_t token, int pos);
+
 // Save/load with optimizer state
 struct Adam;
 void model_save_with_optimizer(const Model& model, const Adam& opt, const std::string& path);

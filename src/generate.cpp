@@ -11,22 +11,36 @@
 #include "gpu_ops.cuh"
 
 std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>& seed,
-                                      float temperature, int top_k, int max_len) {
+                                      float temperature, int top_k, int max_len,
+                                      float rep_penalty) {
   std::vector<uint16_t> tokens = seed;
   std::mt19937 rng(std::random_device{}());
   int vocab_size = model.config.vocab_size;
   std::vector<float> h_logits(vocab_size);
 
+  // Initialize KV cache
+  KVCache cache;
+  kv_cache_alloc(cache, model.config);
+
+  // Process seed with full forward pass to populate cache
+  for (int i = 0; i < static_cast<int>(seed.size()); ++i) {
+    model_forward_cached(model, cache, seed[i], i);
+  }
+
   while (static_cast<int>(tokens.size()) < max_len) {
-    int seq_len = static_cast<int>(tokens.size());
+    // Copy logits from standard location (set by model_forward_cached)
+    gpu_copy_to_host(h_logits.data(), model.act(model.act_offsets.logits), vocab_size);
 
-    // Forward pass on current sequence
-    gpu_zero(model.activations, model.act_offsets.total);
-    model_forward(model, tokens.data(), 1, seq_len);
-
-    // Copy last position's logits from GPU to host
-    gpu_copy_to_host(h_logits.data(),
-                     model.act(model.act_offsets.logits) + (seq_len - 1) * vocab_size, vocab_size);
+    // Repetition penalty: penalize tokens already in sequence
+    if (rep_penalty != 1.0f) {
+      for (uint16_t tok : tokens) {
+        if (h_logits[tok] > 0.0f) {
+          h_logits[tok] /= rep_penalty;
+        } else {
+          h_logits[tok] *= rep_penalty;
+        }
+      }
+    }
 
     // Temperature scaling
     if (temperature != 1.0f) {
@@ -48,13 +62,11 @@ std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>&
 
     // Top-k filtering
     if (top_k > 0 && top_k < vocab_size) {
-      // Find the k-th largest probability
       std::vector<float> sorted_probs = h_logits;
       std::nth_element(sorted_probs.begin(), sorted_probs.begin() + top_k, sorted_probs.end(),
                        std::greater<>());
       float threshold = sorted_probs[top_k];
 
-      // Zero out everything below threshold
       float filtered_sum = 0.0f;
       for (float& v : h_logits) {
         if (v < threshold) {
@@ -63,8 +75,6 @@ std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>&
           filtered_sum += v;
         }
       }
-
-      // Renormalize
       if (filtered_sum > 0.0f) {
         for (float& v : h_logits) {
           v /= filtered_sum;
@@ -89,8 +99,15 @@ std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>&
 
     // Stop on end token
     if (sampled == BPE::END_TOKEN) break;
+
+    // Process the new token through KV cache
+    int pos = static_cast<int>(tokens.size()) - 1;
+    if (pos < max_len) {
+      model_forward_cached(model, cache, sampled, pos);
+    }
   }
 
+  kv_cache_free(cache);
   return tokens;
 }
 
@@ -106,7 +123,8 @@ std::string generate_text(Model& model, const BPE& bpe, const GenerateConfig& co
   }
 
   // Generate
-  auto tokens = generate_tokens(model, seed, config.temperature, config.top_k, config.max_len);
+  auto tokens = generate_tokens(model, seed, config.temperature, config.top_k, config.max_len,
+                                config.rep_penalty);
 
   // Decode
   std::string text = bpe.decode(tokens);

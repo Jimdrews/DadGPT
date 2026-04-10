@@ -11,15 +11,17 @@ struct GenerateConfig {
   std::string vocab_path = "data/vocab.bin";
   std::string merges_path = "data/merges.bin";
   float temperature = 0.8f;
+  float rep_penalty = 1.0f;
   int top_k = 40;
   int max_len = 128;
   int count = 1;
   std::string prompt;
 };
 
-// Generate a sequence of tokens from the model
+// Generate a sequence of tokens from the model (uses KV cache)
 std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>& seed,
-                                      float temperature, int top_k, int max_len);
+                                      float temperature, int top_k, int max_len,
+                                      float rep_penalty = 1.0f);
 
 // Generate text: run generate_tokens, decode with BPE, format output
 std::string generate_text(Model& model, const BPE& bpe, const GenerateConfig& config);

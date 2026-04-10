@@ -570,6 +570,170 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
   gpu_reduce_rows(model.grad(po.pos_emb), model.grad_act(ao.embedded), batch_size, seq_len * d);
 }
 
+void kv_cache_alloc(KVCache& cache, const ModelConfig& config) {
+  cache.n_layers = config.n_layers;
+  cache.n_heads = config.n_heads;
+  cache.d_head = config.d_head();
+  cache.max_len = config.ctx_len;
+  cache.length = 0;
+
+  size_t per_layer = static_cast<size_t>(config.n_heads) * config.ctx_len * cache.d_head;
+  cache.k_cache.resize(config.n_layers);
+  cache.v_cache.resize(config.n_layers);
+  for (int l = 0; l < config.n_layers; ++l) {
+    cache.k_cache[l] = gpu_alloc(per_layer);
+    cache.v_cache[l] = gpu_alloc(per_layer);
+    gpu_zero(cache.k_cache[l], per_layer);
+    gpu_zero(cache.v_cache[l], per_layer);
+  }
+}
+
+void kv_cache_free(KVCache& cache) {
+  for (int l = 0; l < cache.n_layers; ++l) {
+    gpu_free(cache.k_cache[l]);
+    gpu_free(cache.v_cache[l]);
+  }
+  cache.k_cache.clear();
+  cache.v_cache.clear();
+  cache.length = 0;
+}
+
+void model_forward_cached(Model& model, KVCache& cache, uint16_t token, int pos) {
+  const auto& c = model.config;
+  const auto& po = model.param_offsets;
+  auto h = model.cublas_handle;
+  int d = c.d_model;
+  int dh = c.d_head();
+
+  // We use small scratch buffers from model.activations for single-position computation.
+  // The activation buffer is big enough (sized for batch*ctx_len), so we use the first row.
+  // q_buf, k_buf, v_buf: [1, d]
+  // ln_buf: [1, d]
+  // fc1_buf: [1, d_ff]
+  // fc2_buf: [1, d]
+
+  // Allocate temp buffers on stack for host-side single token
+  gpu_copy_u16_to_device(model.d_tokens, &token, 1);
+
+  // Embedding for single token at position pos
+  float* emb = model.activations;  // reuse start of activation buffer
+  gpu_embedding_lookup(emb, model.d_tokens, model.param(po.tok_emb), 1, d);
+  // Add positional embedding for this position
+  gpu_add_vectors(emb, emb, model.param(po.pos_emb) + pos * d, d);
+
+  float* residual = emb;
+  // We need scratch space after emb. Use offsets into activation buffer.
+  float* ln_out = emb + d;
+  float* q_buf = ln_out + d;
+  float* k_buf = q_buf + d;
+  float* v_buf = k_buf + d;
+  float* attn_out_buf = v_buf + d;
+  float* proj_buf = attn_out_buf + d;
+  float* res1_buf = proj_buf + d;
+  float* ln2_buf = res1_buf + d;
+  float* fc1_buf = ln2_buf + d;
+  float* gelu_buf = fc1_buf + c.d_ff;
+  float* fc2_buf = gelu_buf + c.d_ff;
+  float* res2_buf = fc2_buf + d;
+  float* lnf_buf = res2_buf + d;
+  float* logits_buf = lnf_buf + d;
+
+  for (int l = 0; l < c.n_layers; ++l) {
+    const auto& lp = po.layers[l];
+
+    // LayerNorm 1
+    gpu_layernorm(ln_out, residual, model.param(lp.ln1_w), model.param(lp.ln1_b), 1, d);
+
+    // Q, K, V projections for single position
+    gpu_matmul(h, q_buf, ln_out, model.param(lp.Wq), 1, d, d);
+    gpu_matmul(h, k_buf, ln_out, model.param(lp.Wk), 1, d, d);
+    gpu_matmul(h, v_buf, ln_out, model.param(lp.Wv), 1, d, d);
+    gpu_add_bias(q_buf, model.param(lp.bq), 1, d);
+    gpu_add_bias(k_buf, model.param(lp.bk), 1, d);
+    gpu_add_bias(v_buf, model.param(lp.bv), 1, d);
+
+    // Store K, V into cache at position pos
+    // K cache layout: [H, max_len, dh] — copy each head's dh values into position pos
+    // k_buf is [d] = [H*dh], cache is [H, max_len, dh]
+    for (int head = 0; head < c.n_heads; ++head) {
+      // k_buf[head*dh ... head*dh + dh-1] → k_cache[head*max_len*dh + pos*dh]
+      CUDA_CHECK(cudaMemcpy(
+          cache.k_cache[l] + static_cast<size_t>(head) * cache.max_len * dh + pos * dh,
+          k_buf + head * dh, dh * sizeof(float), cudaMemcpyDeviceToDevice));
+      CUDA_CHECK(cudaMemcpy(
+          cache.v_cache[l] + static_cast<size_t>(head) * cache.max_len * dh + pos * dh,
+          v_buf + head * dh, dh * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+
+    // Attention: Q[1, dh] × K_cache[pos+1, dh]^T = scores[1, pos+1] per head
+    // Then softmax, then scores × V_cache = out[1, dh]
+    int cache_len = pos + 1;
+
+    // Use scratch for scores: [H, 1, cache_len] — need H*cache_len floats
+    float* scores_buf = logits_buf + c.vocab_size;  // borrow space after logits area
+
+    for (int head = 0; head < c.n_heads; ++head) {
+      float* q_h = q_buf + head * dh;
+      float* k_cached = cache.k_cache[l] + static_cast<size_t>(head) * cache.max_len * dh;
+      float* v_cached = cache.v_cache[l] + static_cast<size_t>(head) * cache.max_len * dh;
+      float* s_h = scores_buf + head * cache_len;
+
+      // scores = Q[1, dh] × K[cache_len, dh]^T = [1, cache_len]
+      gpu_matmul_transposed_b(h, s_h, q_h, k_cached, 1, dh, cache_len);
+
+      // Scale
+      float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+      gpu_scale(s_h, cache_len, scale);
+    }
+
+    // Softmax each head's row: H rows of cache_len cols
+    gpu_softmax(scores_buf, scores_buf, c.n_heads, cache_len);
+
+    // attn_out per head: scores[1, cache_len] × V[cache_len, dh] = [1, dh]
+    // Merge directly into attn_out_buf [d]
+    for (int head = 0; head < c.n_heads; ++head) {
+      float* s_h = scores_buf + head * cache_len;
+      float* v_cached = cache.v_cache[l] + static_cast<size_t>(head) * cache.max_len * dh;
+      float* out_h = attn_out_buf + head * dh;
+
+      gpu_matmul(h, out_h, s_h, v_cached, 1, cache_len, dh);
+    }
+
+    // Output projection
+    gpu_matmul(h, proj_buf, attn_out_buf, model.param(lp.Wo), 1, d, d);
+    gpu_add_bias(proj_buf, model.param(lp.bo), 1, d);
+
+    // Residual 1
+    gpu_add_vectors(res1_buf, residual, proj_buf, d);
+
+    // LayerNorm 2
+    gpu_layernorm(ln2_buf, res1_buf, model.param(lp.ln2_w), model.param(lp.ln2_b), 1, d);
+
+    // MLP
+    gpu_matmul(h, fc1_buf, ln2_buf, model.param(lp.fc1_w), 1, d, c.d_ff);
+    gpu_add_bias(fc1_buf, model.param(lp.fc1_b), 1, c.d_ff);
+    gpu_gelu(gelu_buf, fc1_buf, c.d_ff);
+    gpu_matmul(h, fc2_buf, gelu_buf, model.param(lp.fc2_w), 1, c.d_ff, d);
+    gpu_add_bias(fc2_buf, model.param(lp.fc2_b), 1, d);
+
+    // Residual 2
+    gpu_add_vectors(res2_buf, res1_buf, fc2_buf, d);
+    residual = res2_buf;
+  }
+
+  // Final layernorm
+  gpu_layernorm(lnf_buf, residual, model.param(po.lnf_w), model.param(po.lnf_b), 1, d);
+
+  // Logits (weight-tied)
+  gpu_matmul_transposed_b(h, logits_buf, lnf_buf, model.param(po.tok_emb), 1, d, c.vocab_size);
+
+  // Copy logits to the standard location so generate_tokens can read them
+  CUDA_CHECK(cudaMemcpy(model.act(model.act_offsets.logits), logits_buf,
+                        c.vocab_size * sizeof(float), cudaMemcpyDeviceToDevice));
+
+  cache.length = pos + 1;
+}
+
 void model_save(const Model& model, const std::string& path) {
   std::ofstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("Cannot write " + path);

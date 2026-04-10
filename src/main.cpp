@@ -141,6 +141,8 @@ int main(int argc, char* argv[]) {
         gc.top_k = std::stoi(argv[++i]);
       } else if (arg == "--count" && i + 1 < argc) {
         gc.count = std::stoi(argv[++i]);
+      } else if (arg == "--rep-penalty" && i + 1 < argc) {
+        gc.rep_penalty = std::stof(argv[++i]);
       } else if (arg == "--prompt" && i + 1 < argc) {
         gc.prompt = argv[++i];
       }
