@@ -321,12 +321,9 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
     // Softmax: B*H*S rows of S cols
     gpu_softmax(model.act(la.attn_scores), model.act(la.attn_scores), BH * seq_len, seq_len);
 
-    // Dropout after attention softmax
-    if (model.training && model.dropout_rate > 0.0f) {
-      gpu_dropout_forward(model.act(la.attn_scores), model.act(la.attn_scores),
-                          model.drop_mask(ao.drop_masks[l].attn_scores),
-                          BH * seq_len * seq_len, model.dropout_rate);
-    }
+    // Note: no dropout on attention scores — applying dropout in-place would corrupt
+    // the softmax output needed by softmax_backward. Dropout is applied after the
+    // attention output projection instead (3 dropout sites total: emb, attn_proj, mlp).
 
     // attn_out = scores × V — all B*H heads in one call
     gpu_matmul_strided_batched(h, model.act(la.attn_out_heads), model.act(la.attn_scores),
@@ -496,13 +493,6 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
     gpu_matmul_strided_batched_at(h, model.grad_act(la.v_heads), model.act(la.attn_scores),
                                   model.grad_act(la.attn_out_heads), seq_len, seq_len, dh,
                                   stride_scores, stride_qkv, stride_qkv, BH);
-
-    // Dropout backward (attention scores)
-    if (model.training && model.dropout_rate > 0.0f) {
-      gpu_dropout_backward(model.grad_act(la.attn_scores),
-                           model.drop_mask(ao.drop_masks[l].attn_scores),
-                           BH * seq_len * seq_len, model.dropout_rate);
-    }
 
     // Softmax backward — use pre-allocated temp buffer
     size_t scores_size = static_cast<size_t>(BH) * seq_len * seq_len;

@@ -654,38 +654,26 @@ void gpu_embedding_backward(float* dtable, const float* dout, const uint16_t* to
 // Dropout kernels
 // ============================================================================
 
-static curandState* d_curand_states = nullptr;
-static int d_curand_max_size = 0;
+// Stateless dropout using Philox counter-based RNG (no shared mutable state).
+// Each thread creates its own local RNG state from (seed, thread_index).
+// The seed increments each call so different dropout invocations produce different masks.
+static unsigned long long d_dropout_seed = 42;
 
-__global__ void curand_init_kernel(curandState* states, unsigned long long seed, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  curand_init(seed, i, 0, &states[i]);
-}
-
-void gpu_dropout_init(unsigned long long seed, int max_size) {
-  if (d_curand_states) gpu_free(d_curand_states);
-  CUDA_CHECK(cudaMalloc(&d_curand_states, max_size * sizeof(curandState)));
-  d_curand_max_size = max_size;
-  int threads = 256;
-  int blocks = (max_size + threads - 1) / threads;
-  curand_init_kernel<<<blocks, threads>>>(d_curand_states, seed, max_size);
-  CUDA_CHECK(cudaGetLastError());
+void gpu_dropout_init(unsigned long long seed, int /*max_size*/) {
+  d_dropout_seed = seed;
 }
 
 void gpu_dropout_free() {
-  if (d_curand_states) {
-    gpu_free(d_curand_states);
-    d_curand_states = nullptr;
-    d_curand_max_size = 0;
-  }
+  // Nothing to free — no persistent GPU state
 }
 
 __global__ void dropout_forward_kernel(float* out, const float* in, uint8_t* mask, int size,
-                                       float rate, curandState* states, int num_states) {
+                                       float rate, unsigned long long seed) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= size) return;
-  float r = curand_uniform(&states[i % num_states]);
+  curandStatePhilox4_32_10_t state;
+  curand_init(seed, i, 0, &state);
+  float r = curand_uniform(&state);
   float scale = 1.0f / (1.0f - rate);
   if (r < rate) {
     mask[i] = 0;
@@ -699,8 +687,7 @@ __global__ void dropout_forward_kernel(float* out, const float* in, uint8_t* mas
 void gpu_dropout_forward(float* out, const float* in, uint8_t* mask, int size, float rate) {
   int threads = 256;
   int blocks = (size + threads - 1) / threads;
-  dropout_forward_kernel<<<blocks, threads>>>(out, in, mask, size, rate, d_curand_states,
-                                              d_curand_max_size);
+  dropout_forward_kernel<<<blocks, threads>>>(out, in, mask, size, rate, d_dropout_seed++);
   CUDA_CHECK(cudaGetLastError());
 }
 
