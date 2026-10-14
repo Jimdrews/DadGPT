@@ -1,5 +1,8 @@
 #include <format>
+#include <functional>
 #include <iostream>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -67,7 +70,8 @@ int prepare(const std::string& data_dir) {
   // Write binary token files
   write_token_file(data_dir + "/train.bin", train_tokens);
   write_token_file(data_dir + "/val.bin", val_tokens);
-  std::cout << "  Saved train.bin and val.bin\n";
+  write_dataset_meta(data_dir, {"dadbpe", bpe.vocab_size()});
+  std::cout << "  Saved train.bin, val.bin and meta.txt\n";
 
   // Verify: decode a sample
   std::cout << "\n--- Sample decode (first 3 jokes from train) ---\n";
@@ -92,81 +96,127 @@ int prepare(const std::string& data_dir) {
   return 0;
 }
 
-}  // namespace
+using FlagTable = std::map<std::string, std::function<void(const std::string&)>>;
 
-int main(int argc, char* argv[]) {
-  if (argc >= 2 && std::string(argv[1]) == "prepare") {
-    std::string data_dir = "data";
-    if (argc >= 3) {
-      data_dir = argv[2];
-    }
-    return prepare(data_dir);
+// Applies "--flag value" pairs from argv[first..]. Unknown flags and missing values are errors
+// rather than being silently ignored.
+void parse_flags(int argc, char* argv[], int first, const FlagTable& flags) {
+  for (int i = first; i < argc; ++i) {
+    std::string arg = argv[i];
+    auto it = flags.find(arg);
+    if (it == flags.end()) throw std::invalid_argument("Unknown option " + arg);
+    if (i + 1 >= argc) throw std::invalid_argument("Missing value for " + arg);
+    it->second(argv[++i]);
+  }
+}
+
+void print_usage() {
+  std::cout << std::format("dad-gpt v0.2.0 | C++{}\n", __cplusplus);
+  std::cout << R"(
+Usage: dad-gpt <command> [options]
+
+  prepare [data_dir]          Tokenize data_dir/{train,test}.csv into train.bin / val.bin
+
+  train                       Train (resumes from the latest data/checkpoint_step_N.bin)
+    --data DIR                data directory (default data)
+    --model NAME              tiny | small | gpt2-124m (default small)
+    --d-model N --layers N --heads N --seq-len N     override the preset
+    --batch N --accum N       micro-batch size and gradient accumulation steps
+    --steps N | --epochs F    optimizer steps, or passes over the training tokens
+    --lr F --warmup N --wd F --dropout F --seed N
+    --log-every N --eval-every N --eval-batches N --ckpt-every N --keep N
+
+  generate                    Sample from a checkpoint
+    --data DIR                data directory with meta.txt and the tokenizer
+    --checkpoint PATH         default: latest checkpoint in --data
+    --prompt TEXT --count N --max-len N
+    --temp F (0 = greedy) --top-k N --rep-penalty F
+)";
+}
+
+int run(int argc, char* argv[]) {
+  std::string cmd = argc >= 2 ? argv[1] : "";
+
+  if (cmd == "prepare") {
+    return prepare(argc >= 3 ? argv[2] : "data");
   }
 
-  if (argc >= 2 && std::string(argv[1]) == "train") {
+  if (cmd == "train") {
     TrainConfig tc;
-    for (int i = 2; i < argc; ++i) {
-      std::string arg = argv[i];
-      if (arg == "--epochs" && i + 1 < argc) {
-        tc.epochs = std::stoi(argv[++i]);
-      } else if (arg == "--data" && i + 1 < argc) {
-        tc.data_dir = argv[++i];
-      } else if (arg == "--batch" && i + 1 < argc) {
-        tc.batch_size = std::stoi(argv[++i]);
-      } else if (arg == "--accum" && i + 1 < argc) {
-        tc.accumulation_steps = std::stoi(argv[++i]);
-      } else if (arg == "--dropout" && i + 1 < argc) {
-        tc.dropout_rate = std::stof(argv[++i]);
-      } else if (arg == "--wd" && i + 1 < argc) {
-        tc.weight_decay = std::stof(argv[++i]);
-      }
-    }
+    auto i = [](int& dst) { return [&dst](const std::string& v) { dst = std::stoi(v); }; };
+    auto f = [](float& dst) { return [&dst](const std::string& v) { dst = std::stof(v); }; };
+    parse_flags(argc, argv, 2,
+                {
+                    {"--data", [&](const std::string& v) { tc.data_dir = v; }},
+                    {"--model", [&](const std::string& v) { tc.model = v; }},
+                    {"--d-model", i(tc.d_model)},
+                    {"--layers", i(tc.n_layers)},
+                    {"--heads", i(tc.n_heads)},
+                    {"--seq-len", i(tc.seq_len)},
+                    {"--batch", i(tc.batch_size)},
+                    {"--accum", i(tc.accumulation_steps)},
+                    {"--steps", i(tc.max_steps)},
+                    {"--epochs", f(tc.epochs)},
+                    {"--lr", f(tc.max_lr)},
+                    {"--warmup", i(tc.warmup_steps)},
+                    {"--wd", f(tc.weight_decay)},
+                    {"--dropout", f(tc.dropout_rate)},
+                    {"--seed", [&](const std::string& v) { tc.seed = std::stoull(v); }},
+                    {"--log-every", i(tc.log_interval)},
+                    {"--eval-every", i(tc.eval_interval)},
+                    {"--eval-batches", i(tc.eval_batches)},
+                    {"--ckpt-every", i(tc.checkpoint_interval)},
+                    {"--keep", i(tc.keep_checkpoints)},
+                });
     if (tc.dropout_rate < 0.0f || tc.dropout_rate >= 1.0f) {
-      std::cerr << "--dropout must be in [0, 1)\n";
-      return 1;
+      throw std::invalid_argument("--dropout must be in [0, 1)");
     }
-    if (tc.accumulation_steps < 1 || tc.batch_size < 1 || tc.epochs < 1) {
-      std::cerr << "--accum, --batch and --epochs must be >= 1\n";
-      return 1;
+    if (tc.accumulation_steps < 1 || tc.batch_size < 1 || tc.log_interval < 1 ||
+        tc.eval_interval < 1) {
+      throw std::invalid_argument("--accum, --batch, --log-every and --eval-every must be >= 1");
     }
     run_training(tc);
     return 0;
   }
 
-  if (argc >= 2 && std::string(argv[1]) == "generate") {
+  if (cmd == "generate") {
     GenerateConfig gc;
-    for (int i = 2; i < argc; ++i) {
-      std::string arg = argv[i];
-      if (arg == "--checkpoint" && i + 1 < argc) {
-        gc.checkpoint_path = argv[++i];
-      } else if (arg == "--vocab" && i + 1 < argc) {
-        gc.vocab_path = argv[++i];
-      } else if (arg == "--merges" && i + 1 < argc) {
-        gc.merges_path = argv[++i];
-      } else if (arg == "--temp" && i + 1 < argc) {
-        gc.temperature = std::stof(argv[++i]);
-      } else if (arg == "--top-k" && i + 1 < argc) {
-        gc.top_k = std::stoi(argv[++i]);
-      } else if (arg == "--count" && i + 1 < argc) {
-        gc.count = std::stoi(argv[++i]);
-      } else if (arg == "--rep-penalty" && i + 1 < argc) {
-        gc.rep_penalty = std::stof(argv[++i]);
-      } else if (arg == "--prompt" && i + 1 < argc) {
-        gc.prompt = argv[++i];
-      }
+    std::string data_dir = "data";
+    parse_flags(argc, argv, 2,
+                {
+                    {"--data", [&](const std::string& v) { data_dir = v; }},
+                    {"--checkpoint", [&](const std::string& v) { gc.checkpoint_path = v; }},
+                    {"--temp", [&](const std::string& v) { gc.temperature = std::stof(v); }},
+                    {"--top-k", [&](const std::string& v) { gc.top_k = std::stoi(v); }},
+                    {"--count", [&](const std::string& v) { gc.count = std::stoi(v); }},
+                    {"--max-len", [&](const std::string& v) { gc.max_len = std::stoi(v); }},
+                    {"--rep-penalty", [&](const std::string& v) { gc.rep_penalty = std::stof(v); }},
+                    {"--prompt", [&](const std::string& v) { gc.prompt = v; }},
+                });
+    gc.data_dir = data_dir;
+    if (gc.checkpoint_path.empty()) gc.checkpoint_path = find_latest_checkpoint(data_dir);
+    if (gc.checkpoint_path.empty()) {
+      throw std::invalid_argument("No checkpoint_step_*.bin in " + data_dir +
+                                  "; pass --checkpoint");
     }
     run_generate(gc);
     return 0;
   }
 
-  std::cout << std::format("dad-gpt v0.1.0 | C++{}\n", __cplusplus);
-  std::cout << "\nUsage: dad-gpt <command>\n";
-  std::cout << "  prepare [data_dir]              - Tokenize dataset\n";
-  std::cout << "  train [--epochs N] [--batch N]  - Train the model\n";
-  std::cout << "        [--data DIR] [--accum N] [--dropout F] [--wd F]\n";
-  std::cout << "  generate [--temp F] [--top-k N] - Generate jokes (--temp 0 = greedy)\n";
-  std::cout << "           [--count N] [--prompt TEXT] [--rep-penalty F]\n";
-  std::cout << "           [--checkpoint PATH] [--vocab PATH] [--merges PATH]\n";
+  print_usage();
+  return cmd.empty() || cmd == "help" || cmd == "--help" ? 0 : 1;
+}
 
-  return 0;
+}  // namespace
+
+int main(int argc, char* argv[]) {
+  try {
+    return run(argc, argv);
+  } catch (const std::invalid_argument& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 2;
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
 }

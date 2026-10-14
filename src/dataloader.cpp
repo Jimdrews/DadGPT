@@ -74,6 +74,27 @@ void write_token_file(const std::string& path, const std::vector<uint16_t>& toke
           static_cast<std::streamsize>(tokens.size() * sizeof(uint16_t)));
 }
 
+DatasetMeta read_dataset_meta(const std::string& data_dir) {
+  DatasetMeta meta;
+  std::ifstream f(data_dir + "/meta.txt");
+  std::string line;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    auto eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+    if (key == "tokenizer") meta.tokenizer = value;
+    if (key == "vocab_size") meta.vocab_size = std::stoi(value);
+  }
+  return meta;
+}
+
+void write_dataset_meta(const std::string& data_dir, const DatasetMeta& meta) {
+  std::ofstream f(data_dir + "/meta.txt");
+  if (!f) throw std::runtime_error("Cannot write " + data_dir + "/meta.txt");
+  f << "tokenizer=" << meta.tokenizer << "\nvocab_size=" << meta.vocab_size << "\n";
+}
+
 DataLoader::DataLoader(const std::string& path, int batch_size, int seq_len)
     : batch_size_(batch_size), seq_len_(seq_len) {
   void* mapped = map_file(path, file_size_);
@@ -149,6 +170,28 @@ Batch DataLoader::next_batch() {
     cursor_ += static_cast<size_t>(seq_len_);
   }
 
+  return batch;
+}
+
+Batch DataLoader::random_batch(std::mt19937_64& rng) const {
+  // Each window needs seq_len + 1 tokens (inputs plus the shifted target)
+  if (num_tokens_ < static_cast<uint64_t>(seq_len_) + 1) {
+    throw std::runtime_error("Token file shorter than one sequence");
+  }
+  std::uniform_int_distribution<uint64_t> start_dist(0, num_tokens_ - seq_len_ - 1);
+
+  Batch batch;
+  size_t total = static_cast<size_t>(batch_size_) * seq_len_;
+  batch.tokens.resize(total);
+  batch.targets.resize(total);
+  for (int b = 0; b < batch_size_; ++b) {
+    uint64_t start = start_dist(rng);
+    size_t dst = static_cast<size_t>(b) * seq_len_;
+    for (int s = 0; s < seq_len_; ++s) {
+      batch.tokens[dst + s] = data_[start + s];
+      batch.targets[dst + s] = data_[start + s + 1];
+    }
+  }
   return batch;
 }
 

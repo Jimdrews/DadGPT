@@ -149,8 +149,9 @@ std::string generate_text(Model& model, const BPE& bpe, const GenerateConfig& co
   }
 
   // Generate
-  auto tokens = generate_tokens(model, seed, config.temperature, config.top_k, config.max_len,
-                                config.rep_penalty);
+  int max_len = config.max_len > 0 ? config.max_len : model.config.ctx_len;
+  auto tokens =
+      generate_tokens(model, seed, config.temperature, config.top_k, max_len, config.rep_penalty);
 
   // Decode
   std::string text = bpe.decode(tokens);
@@ -183,7 +184,7 @@ void run_generate(const GenerateConfig& config) {
 
   // Load tokenizer
   BPE bpe;
-  bpe.load(config.vocab_path, config.merges_path);
+  bpe.load(config.data_dir + "/vocab.bin", config.data_dir + "/merges.bin");
   std::cout << std::format("Loaded tokenizer (vocab_size={})\n", bpe.vocab_size());
 
   // Load model

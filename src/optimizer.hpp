@@ -8,7 +8,7 @@ struct Adam {
   size_t num_params = 0;
   int step = 0;
   float beta1 = 0.9f;
-  float beta2 = 0.999f;
+  float beta2 = 0.95f;  // GPT-2 / nanoGPT; 0.999 adapts too slowly to loss spikes
   float eps = 1e-8f;
   float max_lr = 3e-4f;
   float weight_decay = 0.1f;

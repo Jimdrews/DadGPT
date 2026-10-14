@@ -19,6 +19,13 @@ struct ModelConfig {
   int d_head() const { return d_model / n_heads; }
 };
 
+// Named architectures. vocab_size and batch_size are left at defaults; the caller sets them
+// from the tokenizer and the training run. Throws on an unknown name.
+//   tiny       d=128  L=2  H=4  ff=512   ctx=64    (smoke tests)
+//   small      d=512  L=8  H=8  ff=2048  ctx=128   (the original dad-gpt model)
+//   gpt2-124m  d=768  L=12 H=12 ff=3072  ctx=1024  (GPT-2 small)
+ModelConfig model_preset(const std::string& name);
+
 struct ParameterOffsets {
   size_t tok_emb;
   size_t pos_emb;

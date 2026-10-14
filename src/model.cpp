@@ -195,7 +195,25 @@ float* attn_dropped_probs(Model& model, int layer) {
 
 }  // namespace
 
+ModelConfig model_preset(const std::string& name) {
+  ModelConfig c;
+  if (name == "tiny") {
+    c.d_model = 128, c.n_layers = 2, c.n_heads = 4, c.d_ff = 512, c.ctx_len = 64;
+  } else if (name == "small") {
+    c.d_model = 512, c.n_layers = 8, c.n_heads = 8, c.d_ff = 2048, c.ctx_len = 128;
+  } else if (name == "gpt2-124m") {
+    c.d_model = 768, c.n_layers = 12, c.n_heads = 12, c.d_ff = 3072, c.ctx_len = 1024;
+  } else {
+    throw std::invalid_argument("Unknown model preset '" + name +
+                                "' (expected tiny, small or gpt2-124m)");
+  }
+  return c;
+}
+
 void model_alloc(Model& model, const ModelConfig& config) {
+  if (config.n_heads <= 0 || config.d_model % config.n_heads != 0) {
+    throw std::invalid_argument("d_model must be divisible by n_heads");
+  }
   model.config = config;
   model.param_offsets = compute_param_offsets(config);
   model.act_offsets = compute_act_offsets(config);

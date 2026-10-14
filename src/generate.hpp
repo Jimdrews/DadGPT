@@ -8,13 +8,12 @@
 #include "model.hpp"
 
 struct GenerateConfig {
-  std::string checkpoint_path = "data/checkpoint_epoch_20.bin";
-  std::string vocab_path = "data/vocab.bin";
-  std::string merges_path = "data/merges.bin";
+  std::string data_dir = "data";  // meta.txt and tokenizer files live here
+  std::string checkpoint_path;
   float temperature = 0.8f;
   float rep_penalty = 1.0f;
   int top_k = 40;
-  int max_len = 128;
+  int max_len = 0;  // total tokens including the prompt; 0 = the model's context length
   int count = 1;
   std::string prompt;
 };

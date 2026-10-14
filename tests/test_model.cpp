@@ -360,3 +360,15 @@ TEST(Model, LoadRejectsTruncatedCheckpoint) {
   model_free(loaded);
   std::remove(path.c_str());
 }
+
+TEST(Model, PresetsMatchGpt2Shapes) {
+  ModelConfig c = model_preset("gpt2-124m");
+  c.vocab_size = 50257;
+  EXPECT_EQ(c.d_head(), 64);
+  // GPT-2 small has 124,439,808 parameters (tied lm_head, no separate output matrix)
+  Model model{};
+  model_alloc(model, c);
+  EXPECT_EQ(model.param_offsets.total, 124439808u);
+  model_free(model);
+  EXPECT_THROW(model_preset("gpt5"), std::invalid_argument);
+}
