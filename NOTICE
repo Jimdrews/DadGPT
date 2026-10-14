@@ -1,0 +1,14 @@
+DadGPT
+Copyright 2026 James Andrews
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party material used by this project (not distributed in this repository):
+
+- GPT-2 weights and tokenizer files (vocab.json, merges.txt) by OpenAI,
+  https://huggingface.co/openai-community/gpt2, MIT License.
+- The shuttie/dadjokes dataset, https://huggingface.co/datasets/shuttie/dadjokes,
+  Apache License 2.0, derived from the Reddit Dad Jokes dataset by Oktay Ozturk on Kaggle.
+
+Build dependencies fetched by vcpkg: GoogleTest (BSD-3-Clause),
+nlohmann/json (MIT), PCRE2 (BSD-3-Clause).

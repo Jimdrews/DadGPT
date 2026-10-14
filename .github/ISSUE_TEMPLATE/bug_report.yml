@@ -1,0 +1,45 @@
+name: Bug report
+description: Something builds, trains or generates incorrectly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, what happened instead, and any error output.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, including flags.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: RTX 3060 12 GB
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Windows 11 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: cuda
+    attributes:
+      label: CUDA version
+      description: Output of `nvcc --version`
+    validations:
+      required: true
+  - type: input
+    id: compiler
+    attributes:
+      label: Compiler
+      placeholder: MSVC 19.44 / GCC 14.2
