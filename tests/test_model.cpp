@@ -2,11 +2,16 @@
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
 #include <numeric>
 #include <vector>
 
 #include "gpu_ops.cuh"
 #include "model.hpp"
+#include "optimizer.hpp"
+#include "test_util.hpp"
 
 TEST(Model, DefaultConfig) {
   ModelConfig config;
@@ -185,7 +190,7 @@ TEST(Model, SaveLoadRoundTrip) {
   model_alloc(model, config);
   model.training = false;
 
-  std::string path = "/tmp/test_model.bin";
+  std::string path = test_util::temp_path("model.bin");
   model_save(model, path);
 
   Model loaded{};
@@ -205,6 +210,153 @@ TEST(Model, SaveLoadRoundTrip) {
   }
 
   model_free(model);
+  model_free(loaded);
+  std::remove(path.c_str());
+}
+
+TEST(Model, KVCacheMatchesFullForward) {
+  // Incremental decoding through the KV cache must reproduce the full causal forward pass
+  ModelConfig config;
+  config.d_model = 32;
+  config.n_layers = 2;
+  config.n_heads = 4;
+  config.d_ff = 64;
+  config.ctx_len = 16;
+  config.vocab_size = 100;
+
+  Model model{};
+  model_alloc(model, config);
+  model.training = false;
+
+  std::vector<uint16_t> tokens = {4, 17, 33, 4, 90, 12, 55, 61, 2, 8, 8, 70, 1, 99, 5, 40};
+  int seq_len = static_cast<int>(tokens.size());  // the full context, to cover the last slot
+
+  model_forward(model, tokens.data(), 1, seq_len);
+  std::vector<float> full(static_cast<size_t>(seq_len) * config.vocab_size);
+  gpu_copy_to_host(full.data(), model.act(model.act_offsets.logits), full.size());
+
+  KVCache cache;
+  kv_cache_alloc(cache, config);
+  std::vector<float> step(config.vocab_size);
+  for (int pos = 0; pos < seq_len; ++pos) {
+    model_forward_cached(model, cache, tokens[pos], pos);
+    gpu_copy_to_host(step.data(), model.act(model.act_offsets.logits), step.size());
+    for (int v = 0; v < config.vocab_size; ++v) {
+      ASSERT_NEAR(step[v], full[static_cast<size_t>(pos) * config.vocab_size + v], 1e-4)
+          << "pos " << pos << " vocab " << v;
+    }
+  }
+  EXPECT_EQ(cache.length, seq_len);
+
+  kv_cache_free(cache);
+  model_free(model);
+}
+
+TEST(Model, RejectsShapesBeyondBuffers) {
+  ModelConfig config;
+  config.d_model = 16;
+  config.n_layers = 1;
+  config.n_heads = 2;
+  config.d_ff = 32;
+  config.ctx_len = 8;
+  config.vocab_size = 20;
+  config.batch_size = 2;
+
+  Model model{};
+  model_alloc(model, config);
+  std::vector<uint16_t> tokens(3 * 9, 4);
+
+  EXPECT_THROW(model_forward(model, tokens.data(), 1, 9), std::out_of_range);  // seq > ctx
+  EXPECT_THROW(model_forward(model, tokens.data(), 3, 4), std::out_of_range);  // batch > alloc
+  EXPECT_NO_THROW(model_forward(model, tokens.data(), 2, 8));
+
+  KVCache cache;
+  kv_cache_alloc(cache, config);
+  EXPECT_THROW(model_forward_cached(model, cache, 4, config.ctx_len), std::out_of_range);
+  kv_cache_free(cache);
+  model_free(model);
+}
+
+TEST(Model, SaveLoadWithOptimizerRestoresState) {
+  ModelConfig config;
+  config.d_model = 16;
+  config.n_layers = 1;
+  config.n_heads = 2;
+  config.d_ff = 32;
+  config.ctx_len = 8;
+  config.vocab_size = 20;
+  config.batch_size = 4;
+
+  Model model{};
+  model_alloc(model, config);
+  size_t n = model.param_offsets.total;
+
+  Adam opt;
+  opt.step = 1234;
+  opt.m = gpu_alloc(n);
+  opt.v = gpu_alloc(n);
+  std::vector<float> h_m(n), h_v(n);
+  for (size_t i = 0; i < n; ++i) {
+    h_m[i] = 0.001f * static_cast<float>(i % 97);
+    h_v[i] = 0.002f * static_cast<float>(i % 89);
+  }
+  gpu_copy_to_device(opt.m, h_m.data(), n);
+  gpu_copy_to_device(opt.v, h_v.data(), n);
+
+  std::string path = test_util::temp_path("ckpt_opt.bin");
+  model_save_with_optimizer(model, opt, path);
+
+  // Resume with a different batch size: buffers must follow the override
+  Model loaded{};
+  Adam opt2;
+  model_load_with_optimizer(loaded, opt2, path, /*batch_size=*/7);
+  EXPECT_EQ(loaded.config.batch_size, 7);
+  EXPECT_EQ(opt2.step, 1234);
+  ASSERT_NE(opt2.m, nullptr);
+  ASSERT_NE(opt2.v, nullptr);
+
+  std::vector<float> got(n);
+  gpu_copy_to_host(got.data(), opt2.m, n);
+  EXPECT_EQ(got, h_m);
+  gpu_copy_to_host(got.data(), opt2.v, n);
+  EXPECT_EQ(got, h_v);
+
+  std::vector<float> orig(n);
+  gpu_copy_to_host(orig.data(), model.params, n);
+  gpu_copy_to_host(got.data(), loaded.params, n);
+  EXPECT_EQ(got, orig);
+
+  // A batch of 7 must now fit
+  std::vector<uint16_t> tokens(7 * 8, 4);
+  EXPECT_NO_THROW(model_forward(loaded, tokens.data(), 7, 8));
+
+  gpu_free(opt.m);
+  gpu_free(opt.v);
+  gpu_free(opt2.m);
+  gpu_free(opt2.v);
+  model_free(model);
+  model_free(loaded);
+  std::remove(path.c_str());
+}
+
+TEST(Model, LoadRejectsTruncatedCheckpoint) {
+  ModelConfig config;
+  config.d_model = 16;
+  config.n_layers = 1;
+  config.n_heads = 2;
+  config.d_ff = 32;
+  config.ctx_len = 8;
+  config.vocab_size = 20;
+
+  Model model{};
+  model_alloc(model, config);
+  std::string path = test_util::temp_path("ckpt_trunc.bin");
+  model_save(model, path);
+  model_free(model);
+
+  std::filesystem::resize_file(path, std::filesystem::file_size(path) / 2);
+  Model loaded{};
+  EXPECT_THROW(model_load(loaded, path), std::runtime_error);
   model_free(loaded);
   std::remove(path.c_str());
 }

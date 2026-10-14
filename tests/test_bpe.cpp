@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "bpe.hpp"
+#include "test_util.hpp"
 
 TEST(BPE, TrainProducesTargetVocabSize) {
   BPE bpe;
@@ -68,16 +69,18 @@ TEST(BPE, SaveLoadRoundTrip) {
   std::string text = "hello world foo bar";
   auto original_tokens = bpe.encode(text);
 
-  bpe.save("/tmp/test_vocab.bin", "/tmp/test_merges.bin");
+  std::string vocab_path = test_util::temp_path("vocab.bin");
+  std::string merges_path = test_util::temp_path("merges.bin");
+  bpe.save(vocab_path, merges_path);
 
   BPE loaded;
-  loaded.load("/tmp/test_vocab.bin", "/tmp/test_merges.bin");
+  loaded.load(vocab_path, merges_path);
 
   auto loaded_tokens = loaded.encode(text);
   EXPECT_EQ(original_tokens, loaded_tokens);
   EXPECT_EQ(loaded.decode(loaded_tokens), text);
   EXPECT_EQ(loaded.vocab_size(), bpe.vocab_size());
 
-  std::remove("/tmp/test_vocab.bin");
-  std::remove("/tmp/test_merges.bin");
+  std::remove(vocab_path.c_str());
+  std::remove(merges_path.c_str());
 }

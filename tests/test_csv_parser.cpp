@@ -4,11 +4,12 @@
 #include <fstream>
 
 #include "csv_parser.hpp"
+#include "test_util.hpp"
 
 namespace {
 
 std::string write_temp_csv(const std::string& content) {
-  std::string path = "/tmp/test_jokes.csv";
+  std::string path = test_util::temp_path("jokes.csv");
   std::ofstream f(path);
   f << content;
   return path;

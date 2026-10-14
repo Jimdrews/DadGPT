@@ -4,11 +4,12 @@
 #include <vector>
 
 #include "dataloader.hpp"
+#include "test_util.hpp"
 
 namespace {
 
 std::string create_test_token_file(const std::vector<uint16_t>& tokens) {
-  std::string path = "/tmp/test_tokens.bin";
+  std::string path = test_util::temp_path("tokens.bin");
   write_token_file(path, tokens);
   return path;
 }
