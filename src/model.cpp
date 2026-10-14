@@ -127,21 +127,23 @@ void init_weights(Model& model) {
 
   std::mt19937 rng(42);
 
-  auto xavier_init = [&](size_t offset, int fan_in, int fan_out, int count) {
-    float limit = std::sqrt(6.0f / static_cast<float>(fan_in + fan_out));
-    std::uniform_real_distribution<float> dist(-limit, limit);
-    for (int i = 0; i < count; ++i) h_params[offset + i] = dist(rng);
+  auto normal_init = [&](size_t offset, size_t count, float std_dev) {
+    std::normal_distribution<float> dist(0.0f, std_dev);
+    for (size_t i = 0; i < count; ++i) h_params[offset + i] = dist(rng);
   };
 
-  auto normal_init = [&](size_t offset, int count, float std_dev) {
-    std::normal_distribution<float> dist(0.0f, std_dev);
-    for (int i = 0; i < count; ++i) h_params[offset + i] = dist(rng);
-  };
+  // GPT-2 init: every weight N(0, 0.02); the two projections that write into the residual
+  // stream (Wo, fc2) are scaled by 1/sqrt(2 * n_layers) so the residual variance stays
+  // roughly constant with depth. Biases are zero, LayerNorm weights one.
+  const float std_dev = 0.02f;
+  const float residual_std = std_dev / std::sqrt(2.0f * static_cast<float>(c.n_layers));
+  const size_t dd = static_cast<size_t>(c.d_model) * c.d_model;
+  const size_t dff = static_cast<size_t>(c.d_model) * c.d_ff;
 
   const auto& po = model.param_offsets;
 
-  normal_init(po.tok_emb, c.vocab_size * c.d_model, 0.02f);
-  normal_init(po.pos_emb, c.ctx_len * c.d_model, 0.02f);
+  normal_init(po.tok_emb, static_cast<size_t>(c.vocab_size) * c.d_model, std_dev);
+  normal_init(po.pos_emb, static_cast<size_t>(c.ctx_len) * c.d_model, std_dev);
 
   for (int l = 0; l < c.n_layers; ++l) {
     const auto& ly = po.layers[l];
@@ -151,12 +153,12 @@ void init_weights(Model& model) {
       h_params[ly.ln2_w + i] = 1.0f;
     }
 
-    xavier_init(ly.Wq, c.d_model, c.d_model, c.d_model * c.d_model);
-    xavier_init(ly.Wk, c.d_model, c.d_model, c.d_model * c.d_model);
-    xavier_init(ly.Wv, c.d_model, c.d_model, c.d_model * c.d_model);
-    xavier_init(ly.Wo, c.d_model, c.d_model, c.d_model * c.d_model);
-    xavier_init(ly.fc1_w, c.d_model, c.d_ff, c.d_model * c.d_ff);
-    xavier_init(ly.fc2_w, c.d_ff, c.d_model, c.d_ff * c.d_model);
+    normal_init(ly.Wq, dd, std_dev);
+    normal_init(ly.Wk, dd, std_dev);
+    normal_init(ly.Wv, dd, std_dev);
+    normal_init(ly.Wo, dd, residual_std);
+    normal_init(ly.fc1_w, dff, std_dev);
+    normal_init(ly.fc2_w, dff, residual_std);
   }
 
   for (int i = 0; i < c.d_model; ++i) {
@@ -173,6 +175,22 @@ void check_batch_shape(const ModelConfig& c, int batch_size, int seq_len) {
                             std::to_string(seq_len) + " exceeds model buffers " +
                             std::to_string(c.batch_size) + "x" + std::to_string(c.ctx_len));
   }
+}
+
+// Dropped attention probabilities, one [B*H, ctx, ctx] block per layer. Kept outside the
+// activation layout so it doesn't also get a (never used) gradient mirror.
+size_t attn_block_size(const ModelConfig& c) {
+  return static_cast<size_t>(c.batch_size) * c.n_heads * c.ctx_len * c.ctx_len;
+}
+
+void ensure_attn_dropout_buffer(Model& model) {
+  if (!model.attn_dropped) {
+    model.attn_dropped = gpu_alloc(attn_block_size(model.config) * model.config.n_layers);
+  }
+}
+
+float* attn_dropped_probs(Model& model, int layer) {
+  return model.attn_dropped + attn_block_size(model.config) * layer;
 }
 
 }  // namespace
@@ -247,6 +265,7 @@ void model_free(Model& model) {
   gpu_free(model.dropout_masks);
   gpu_free(model.decay_flags);
   gpu_free(model.d_tokens);
+  gpu_free(model.attn_dropped);
   gpu_dropout_free();
   model.params = nullptr;
   model.activations = nullptr;
@@ -256,6 +275,7 @@ void model_free(Model& model) {
   model.dropout_masks = nullptr;
   model.decay_flags = nullptr;
   model.d_tokens = nullptr;
+  model.attn_dropped = nullptr;
   model.cublas_handle = nullptr;
 }
 
@@ -272,6 +292,9 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
   int d = c.d_model;
   int BS = batch_size * seq_len;  // flattened batch*seq for row-independent ops
   check_batch_shape(c, batch_size, seq_len);
+
+  bool attn_dropout = model.training && model.dropout_rate > 0.0f;
+  if (attn_dropout) ensure_attn_dropout_buffer(model);
 
   // Copy tokens to device
   gpu_copy_u16_to_device(model.d_tokens, tokens, BS);
@@ -332,14 +355,19 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
     // Softmax: B*H*S rows of S cols
     gpu_softmax(model.act(la.attn_scores), model.act(la.attn_scores), BH * seq_len, seq_len);
 
-    // Note: no dropout on attention scores — applying dropout in-place would corrupt
-    // the softmax output needed by softmax_backward. Dropout is applied after the
-    // attention output projection instead (3 dropout sites total: emb, attn_proj, mlp).
+    // Attention dropout. The softmax output P stays in attn_scores (softmax backward needs
+    // it); the dropped probabilities go to a separate buffer that is used for P × V.
+    const float* probs = model.act(la.attn_scores);
+    if (attn_dropout) {
+      float* dropped = attn_dropped_probs(model, l);
+      gpu_dropout_forward(dropped, probs, model.drop_mask(ao.drop_masks[l].attn_scores),
+                          BH * seq_len * seq_len, model.dropout_rate);
+      probs = dropped;
+    }
 
-    // attn_out = scores × V — all B*H heads in one call
-    gpu_matmul_strided_batched(h, model.act(la.attn_out_heads), model.act(la.attn_scores),
-                               model.act(la.v_heads), seq_len, seq_len, dh, stride_scores,
-                               stride_qkv, stride_qkv, BH);
+    // attn_out = probs × V — all B*H heads in one call
+    gpu_matmul_strided_batched(h, model.act(la.attn_out_heads), probs, model.act(la.v_heads),
+                               seq_len, seq_len, dh, stride_scores, stride_qkv, stride_qkv, BH);
 
     // Merge heads: [B*H, S, dh] → [B*S, D]
     gpu_merge_heads(model.act(la.attn_out), model.act(la.attn_out_heads), batch_size, seq_len,
@@ -403,6 +431,7 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
   int d = c.d_model;
   int BS = batch_size * seq_len;
   check_batch_shape(c, batch_size, seq_len);
+  bool attn_dropout = model.training && model.dropout_rate > 0.0f;
 
   // 4. Backward logits: logits = lnf_out × tok_emb^T
   gpu_matmul(h, model.grad_act(ao.lnf_out), model.grad_act(ao.logits), model.param(po.tok_emb),
@@ -489,48 +518,45 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
     long long stride_qkv = static_cast<long long>(seq_len) * dh;
     long long stride_scores = static_cast<long long>(seq_len) * seq_len;
 
-    // Dropout backward (attention scores) — apply mask before d_scores computation
-    // Note: d_scores is about to be overwritten, but the dropout on attn_scores
-    // in forward means the V multiplication used masked scores. The gradient of
-    // attn_out = dropout(softmax(scores)) * V needs the dropout mask applied to
-    // the gradient flowing into softmax backward. We handle this by applying
-    // the mask to d_scores AFTER computing it (since d_scores = d_out * V^T uses
-    // the unmasked positions correctly, then we mask before softmax backward).
+    // Forward was attn_out = Pd × V with Pd = dropout(P), or P itself without dropout
+    const float* probs =
+        attn_dropout ? attn_dropped_probs(model, l) : model.act(la.attn_scores);
 
-    // d_scores = d_attn_out × V^T  (all B*H heads at once)
+    // d_Pd = d_attn_out × V^T  (all B*H heads at once)
     gpu_matmul_strided_batched_bt(h, model.grad_act(la.attn_scores),
                                   model.grad_act(la.attn_out_heads), model.act(la.v_heads),
                                   seq_len, dh, seq_len, stride_qkv, stride_qkv, stride_scores, BH);
 
-    // d_V += scores^T × d_attn_out (all B*H heads, accumulate)
-    gpu_matmul_strided_batched_at(h, model.grad_act(la.v_heads), model.act(la.attn_scores),
+    // d_V += Pd^T × d_attn_out (all B*H heads, accumulate)
+    gpu_matmul_strided_batched_at(h, model.grad_act(la.v_heads), probs,
                                   model.grad_act(la.attn_out_heads), seq_len, seq_len, dh,
                                   stride_scores, stride_qkv, stride_qkv, BH);
 
-    // Softmax backward — use pre-allocated temp buffer
+    // d_P = mask * scale * d_Pd, then back through the softmax using the undropped P
     size_t scores_size = static_cast<size_t>(BH) * seq_len * seq_len;
-    gpu_zero(model.temp_scores, scores_size);
-    gpu_softmax_backward(model.temp_scores, model.grad_act(la.attn_scores),
-                         model.act(la.attn_scores), BH * seq_len, seq_len);
+    if (attn_dropout) {
+      gpu_dropout_backward(model.grad_act(la.attn_scores),
+                           model.drop_mask(ao.drop_masks[l].attn_scores),
+                           static_cast<int>(scores_size), model.dropout_rate);
+    }
+    float* d_scores = model.temp_scores;
+    gpu_zero(d_scores, scores_size);
+    gpu_softmax_backward(d_scores, model.grad_act(la.attn_scores), model.act(la.attn_scores),
+                         BH * seq_len, seq_len);
 
     // Zero out causal mask positions and apply scale
-    gpu_causal_mask_zero(model.temp_scores, BH, seq_len);
+    gpu_causal_mask_zero(d_scores, BH, seq_len);
     float attn_scale = 1.0f / std::sqrt(static_cast<float>(dh));
-    gpu_scale(model.temp_scores, static_cast<int>(scores_size), attn_scale);
-
-    // Copy back to grad_act
-    CUDA_CHECK(cudaMemcpy(model.grad_act(la.attn_scores), model.temp_scores,
-                          scores_size * sizeof(float), cudaMemcpyDeviceToDevice));
+    gpu_scale(d_scores, static_cast<int>(scores_size), attn_scale);
 
     // d_Q = d_scores × K  (all B*H heads)
-    gpu_matmul_strided_batched(h, model.grad_act(la.q_heads), model.grad_act(la.attn_scores),
-                               model.act(la.k_heads), seq_len, seq_len, dh, stride_scores,
-                               stride_qkv, stride_qkv, BH);
+    gpu_matmul_strided_batched(h, model.grad_act(la.q_heads), d_scores, model.act(la.k_heads),
+                               seq_len, seq_len, dh, stride_scores, stride_qkv, stride_qkv, BH);
 
     // d_K += d_scores^T × Q (all B*H heads, accumulate)
-    gpu_matmul_strided_batched_at(h, model.grad_act(la.k_heads), model.grad_act(la.attn_scores),
-                                  model.act(la.q_heads), seq_len, seq_len, dh, stride_scores,
-                                  stride_qkv, stride_qkv, BH);
+    gpu_matmul_strided_batched_at(h, model.grad_act(la.k_heads), d_scores, model.act(la.q_heads),
+                                  seq_len, seq_len, dh, stride_scores, stride_qkv, stride_qkv,
+                                  BH);
 
     // Merge head gradients: [B*H, S, dh] → [B*S, D]
     gpu_merge_heads(model.grad_act(la.q), model.grad_act(la.q_heads), batch_size, seq_len,

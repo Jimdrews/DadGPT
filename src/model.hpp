@@ -86,6 +86,7 @@ struct Model {
   uint8_t* dropout_masks = nullptr;
   uint8_t* decay_flags = nullptr;  // per-param weight decay flags for AdamW
   uint16_t* d_tokens = nullptr;    // device buffer for input tokens
+  float* attn_dropped = nullptr;   // dropout(softmax) per layer, allocated on first use
   ParameterOffsets param_offsets;
   ActivationOffsets act_offsets;
   cublasHandle_t cublas_handle = nullptr;

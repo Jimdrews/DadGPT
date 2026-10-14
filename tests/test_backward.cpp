@@ -225,13 +225,16 @@ TEST(Backward, GpuSoftmaxRowsSumToOne) {
   gpu_free(d_out);
 }
 
-TEST(Backward, FullModelGradientCheck) {
-  // Finite differences over every parameter group (attention, LayerNorms, MLP, biases,
-  // tied token embedding, positional embedding) with batch 2 and seq_len < ctx_len.
+// Finite differences over every parameter group (attention, LayerNorms, MLP, biases,
+// tied token embedding, positional embedding) with batch 2 and seq_len < ctx_len.
+// With dropout, every forward re-seeds the RNG so all passes see identical masks and the
+// loss stays a deterministic, smooth function of the parameters.
+void full_model_gradient_check(float dropout_rate) {
   ModelConfig config = tiny_config(2);
   Model model{};
   model_alloc(model, config);
-  model.training = false;  // dropout off: the loss must be a deterministic function of params
+  model.training = dropout_rate > 0.0f;
+  model.dropout_rate = dropout_rate;
 
   const int batch = 2, seq_len = 6;
   // Repeated tokens exercise the embedding scatter-add
@@ -240,13 +243,35 @@ TEST(Backward, FullModelGradientCheck) {
   uint16_t* d_targets = gpu_alloc_u16(batch * seq_len);
   gpu_copy_u16_to_device(d_targets, targets, batch * seq_len);
 
+  // Training init (N(0, 0.02)) leaves attention near-uniform and the residual stream tiny,
+  // so some gradients sit at float32 noise level. Gradient checks want O(1)-conditioned
+  // random parameters instead: everything ~N(0, 0.3), LayerNorm weights around 1.
+  {
+    std::mt19937 prng(77);
+    std::normal_distribution<float> dist(0.0f, 0.3f);
+    std::vector<float> h_params(model.param_offsets.total);
+    for (float& p : h_params) p = dist(prng);
+    auto ones_ish = [&](size_t offset) {
+      for (int i = 0; i < config.d_model; ++i) h_params[offset + i] += 1.0f;
+    };
+    ones_ish(model.param_offsets.lnf_w);
+    for (const auto& ly : model.param_offsets.layers) {
+      ones_ish(ly.ln1_w);
+      ones_ish(ly.ln2_w);
+    }
+    gpu_copy_to_device(model.params, h_params.data(), h_params.size());
+  }
+
+  auto loss_fn = [&]() {
+    gpu_dropout_init(2024, 0);
+    return forward_loss(model, tokens, d_targets, batch, seq_len);
+  };
+
   model_zero_grad(model);
-  forward_loss(model, tokens, d_targets, batch, seq_len);
+  loss_fn();
   model_backward(model, tokens, batch, seq_len);
   std::vector<float> analytical(model.param_offsets.total);
   gpu_copy_to_host(analytical.data(), model.gradients, analytical.size());
-
-  auto loss_fn = [&]() { return forward_loss(model, tokens, d_targets, batch, seq_len); };
 
   std::mt19937 rng(1234);
   for (const auto& g : all_param_groups(model)) {
@@ -258,17 +283,20 @@ TEST(Backward, FullModelGradientCheck) {
       }
       continue;
     }
-    // Step sizes from an h sweep: weights are float32-noise-limited (error ~ 1/h, ~0.1-1% at
-    // h=0.1); embeddings (std 0.02) are truncation-limited and best near h=1e-2. A genuinely
-    // wrong gradient term shows up as >= 30% error.
-    bool embedding = g.name == "tok_emb" || g.name == "pos_emb";
-    double err = fd_relative_error(model, g, analytical, loss_fn, 24, rng, embedding ? 1e-2f : 1e-1f);
-    EXPECT_LT(err, 2e-2) << g.name << " gradient relative error " << err;
+    // h = 3e-2 from a sweep over {3e-3 .. 1e-1}: worst group error 0.26% (no dropout) and
+    // 0.08% (dropout 0.3). A genuinely wrong gradient term shows up as >= 30% error.
+    double err = fd_relative_error(model, g, analytical, loss_fn, 24, rng, 3e-2f);
+    EXPECT_LT(err, 1e-2) << g.name << " gradient relative error " << err;
   }
 
   gpu_free(d_targets);
   model_free(model);
 }
+
+TEST(Backward, FullModelGradientCheck) { full_model_gradient_check(0.0f); }
+
+// Covers the dropout backward at all four sites, including attention probabilities.
+TEST(Backward, FullModelGradientCheckWithDropout) { full_model_gradient_check(0.3f); }
 
 TEST(Backward, AccumulatedMicroBatchesMatchFullBatch) {
   // Two batch-1 backward passes, summed and averaged, must equal one batch-2 pass for
