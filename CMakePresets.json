@@ -68,6 +68,7 @@
       },
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_CXX_FLAGS": "/DWIN32 /D_WINDOWS /EHsc /Zc:__cplusplus",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     },
