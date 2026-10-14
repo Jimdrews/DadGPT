@@ -1,10 +1,11 @@
-#include "gpu_ops.cuh"
+#include <curand_kernel.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <curand_kernel.h>
 #include <vector>
+
+#include "gpu_ops.cuh"
 
 // ============================================================================
 // Memory helpers
@@ -44,9 +45,7 @@ void gpu_copy_u16_to_device(uint16_t* dst, const uint16_t* src, size_t count) {
   CUDA_CHECK(cudaMemcpy(dst, src, count * sizeof(uint16_t), cudaMemcpyHostToDevice));
 }
 
-void gpu_zero(float* ptr, size_t count) {
-  CUDA_CHECK(cudaMemset(ptr, 0, count * sizeof(float)));
-}
+void gpu_zero(float* ptr, size_t count) { CUDA_CHECK(cudaMemset(ptr, 0, count * sizeof(float))); }
 
 void gpu_memory_info(size_t& free_bytes, size_t& total_bytes) {
   CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -95,59 +94,50 @@ cublasStatus_t sgemm_strided_batched(cublasHandle_t h, cublasOperation_t ta, cub
 void gpu_matmul(cublasHandle_t handle, float* out, const float* a, const float* b, int M, int K,
                 int N) {
   float alpha = 1.0f, beta = 0.0f;
-  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N, a, K, &beta,
-                           out, N));
+  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N, a, K, &beta, out, N));
 }
 
 // Row-major C = A^T × B  where A is (K×M), result is (M×N)
 void gpu_matmul_transposed_a(cublasHandle_t handle, float* out, const float* a, const float* b,
                              int M, int K, int N, bool accumulate) {
   float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
-  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N, a, M, &beta,
-                           out, N));
+  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N, a, M, &beta, out, N));
 }
 
 // Row-major C = A × B^T  where B is (N×K), result is (M×N)
 void gpu_matmul_transposed_b(cublasHandle_t handle, float* out, const float* a, const float* b,
                              int M, int K, int N) {
   float alpha = 1.0f, beta = 0.0f;
-  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K, a, K, &beta,
-                           out, N));
+  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K, a, K, &beta, out, N));
 }
 
 // --- Batched strided cuBLAS ---
 
 // Row-major C[i] = A[i] × B[i]^T, batch_count matrices
 void gpu_matmul_strided_batched_bt(cublasHandle_t handle, float* out, const float* a,
-                                   const float* b, int M, int K, int N,
-                                   long long strideA, long long strideB, long long strideC,
-                                   int batch_count) {
+                                   const float* b, int M, int K, int N, long long strideA,
+                                   long long strideB, long long strideC, int batch_count) {
   float alpha = 1.0f, beta = 0.0f;
   CUBLAS_CHECK(sgemm_strided_batched(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K,
-                                         strideB, a, K, strideA, &beta, out, N, strideC,
-                                         batch_count));
+                                     strideB, a, K, strideA, &beta, out, N, strideC, batch_count));
 }
 
 // Row-major C[i] = A[i] × B[i], batch_count matrices
-void gpu_matmul_strided_batched(cublasHandle_t handle, float* out, const float* a,
-                                const float* b, int M, int K, int N,
-                                long long strideA, long long strideB, long long strideC,
-                                int batch_count) {
+void gpu_matmul_strided_batched(cublasHandle_t handle, float* out, const float* a, const float* b,
+                                int M, int K, int N, long long strideA, long long strideB,
+                                long long strideC, int batch_count) {
   float alpha = 1.0f, beta = 0.0f;
   CUBLAS_CHECK(sgemm_strided_batched(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N,
-                                         strideB, a, K, strideA, &beta, out, N, strideC,
-                                         batch_count));
+                                     strideB, a, K, strideA, &beta, out, N, strideC, batch_count));
 }
 
 // Row-major C[i] += A[i]^T × B[i] (accumulate), A is (K×M), B is (K×N), C is (M×N)
 void gpu_matmul_strided_batched_at(cublasHandle_t handle, float* out, const float* a,
-                                   const float* b, int M, int K, int N,
-                                   long long strideA, long long strideB, long long strideC,
-                                   int batch_count) {
+                                   const float* b, int M, int K, int N, long long strideA,
+                                   long long strideB, long long strideC, int batch_count) {
   float alpha = 1.0f, beta = 1.0f;  // beta=1 for accumulate
   CUBLAS_CHECK(sgemm_strided_batched(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N,
-                                         strideB, a, M, strideA, &beta, out, N, strideC,
-                                         batch_count));
+                                     strideB, a, M, strideA, &beta, out, N, strideC, batch_count));
 }
 
 // ============================================================================
@@ -331,8 +321,7 @@ __global__ void reduce_rows_kernel(float* dst, const float* src, int rows, int c
   int c = blockIdx.x * kReduceCols + threadIdx.x;
   float sum = 0.0f;
   if (c < cols) {
-    for (int r = blockIdx.y * kReduceLanes + threadIdx.y; r < rows;
-         r += gridDim.y * kReduceLanes) {
+    for (int r = blockIdx.y * kReduceLanes + threadIdx.y; r < rows; r += gridDim.y * kReduceLanes) {
       sum += src[static_cast<size_t>(r) * cols + c];
     }
   }
@@ -546,8 +535,8 @@ void gpu_matmul_backward(cublasHandle_t handle, const float* dout, const float* 
   CUBLAS_CHECK(
       sgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &alpha, b, N, dout, N, &beta, da, K));
   // db += a^T × dout
-  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, &alpha, dout, N, a, K, &beta,
-                           db, N));
+  CUBLAS_CHECK(
+      sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, &alpha, dout, N, a, K, &beta, db, N));
 }
 
 __global__ void softmax_backward_kernel(float* din, const float* dout, const float* out, int cols) {
@@ -686,8 +675,8 @@ void gpu_gelu_backward(float* din, const float* dout, const float* in, int size)
   CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void embedding_backward_kernel(float* dtable, const float* dout,
-                                          const uint16_t* tokens, int num_tokens, int d_model) {
+__global__ void embedding_backward_kernel(float* dtable, const float* dout, const uint16_t* tokens,
+                                          int num_tokens, int d_model) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = num_tokens * d_model;
   if (idx >= total) return;
@@ -714,9 +703,7 @@ void gpu_embedding_backward(float* dtable, const float* dout, const uint16_t* to
 // The seed increments each call so different dropout invocations produce different masks.
 static unsigned long long d_dropout_seed = 42;
 
-void gpu_dropout_init(unsigned long long seed, int /*max_size*/) {
-  d_dropout_seed = seed;
-}
+void gpu_dropout_init(unsigned long long seed, int /*max_size*/) { d_dropout_seed = seed; }
 
 void gpu_dropout_free() {
   // Nothing to free — no persistent GPU state
@@ -766,8 +753,8 @@ void gpu_dropout_backward(float* dout, const uint8_t* mask, int size, float rate
 // ============================================================================
 
 __global__ void adamw_kernel(float* params, const float* grads, float* m, float* v,
-                            const uint8_t* decay_flags, size_t num_params, float lr, float beta1,
-                            float beta2, float eps, float weight_decay, float bc1, float bc2) {
+                             const uint8_t* decay_flags, size_t num_params, float lr, float beta1,
+                             float beta2, float eps, float weight_decay, float bc1, float bc2) {
   size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (i >= num_params) return;
   // Decoupled weight decay (before Adam update)
@@ -795,8 +782,8 @@ void gpu_adamw_step(float* params, const float* grads, float* m, float* v,
 }
 
 __global__ void adam_kernel(float* params, const float* grads, float* m, float* v,
-                           size_t num_params, float lr, float beta1, float beta2, float eps,
-                           float bc1, float bc2) {
+                            size_t num_params, float lr, float beta1, float beta2, float eps,
+                            float bc1, float bc2) {
   size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (i >= num_params) return;
   float g = grads[i];
@@ -808,13 +795,13 @@ __global__ void adam_kernel(float* params, const float* grads, float* m, float* 
 }
 
 void gpu_adam_step(float* params, const float* grads, float* m, float* v, size_t num_params,
-                  float lr, float beta1, float beta2, float eps, int step) {
+                   float lr, float beta1, float beta2, float eps, int step) {
   float bc1 = 1.0f - powf(beta1, (float)step);
   float bc2 = 1.0f - powf(beta2, (float)step);
   int threads = 256;
   int blocks = (int)((num_params + threads - 1) / threads);
   adam_kernel<<<blocks, threads>>>(params, grads, m, v, num_params, lr, beta1, beta2, eps, bc1,
-                                  bc2);
+                                   bc2);
   CUDA_CHECK(cudaGetLastError());
 }
 

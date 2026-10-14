@@ -5,8 +5,8 @@
 
 #include "tensor_ops.hpp"
 
-void matmul_backward(const float* dout, const float* a, const float* b, float* da, float* db,
-                     int M, int K, int N) {
+void matmul_backward(const float* dout, const float* a, const float* b, float* da, float* db, int M,
+                     int K, int N) {
   // da += dout × b^T: da[i][k] += sum_j dout[i][j] * b[k][j]
   for (int i = 0; i < M; ++i) {
     for (int k = 0; k < K; ++k) {

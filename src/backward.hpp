@@ -3,8 +3,8 @@
 #include <cstdint>
 
 // Backward for C = A × B: dA += dC × B^T, dB += A^T × dC
-void matmul_backward(const float* dout, const float* a, const float* b, float* da, float* db,
-                     int M, int K, int N);
+void matmul_backward(const float* dout, const float* a, const float* b, float* da, float* db, int M,
+                     int K, int N);
 
 // Backward for row-wise softmax: din_i = out_i * (dout_i - sum(dout * out))
 void softmax_backward(const float* dout, const float* out, float* din, int rows, int cols);

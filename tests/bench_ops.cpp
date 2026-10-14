@@ -62,17 +62,25 @@ TEST(Bench, DISABLED_OpTimings) {
   std::vector<Row> rows = {
       {"sgemm BSxd * dxd (QKV/Wo fwd)", time_ms([&] { gpu_matmul(h, y, x, w, BS, d, d); }), 4 * 8},
       {"sgemm BSxd * dxff (fc1 fwd)", time_ms([&] { gpu_matmul(h, y, x, w, BS, d, ff); }), 2 * 8},
-      {"matmul_backward BSxd*dxd", time_ms([&] { gpu_matmul_backward(h, y, x, w, z, dw, BS, d, d); }), 4 * 8},
-      {"matmul_backward BSxd*dxff", time_ms([&] { gpu_matmul_backward(h, y, x, w, z, dw, BS, d, ff); }), 2 * 8},
-      {"attn scores batched (QK^T)", time_ms([&] { gpu_matmul_strided_batched_bt(h, scores, x, y, S, dh, S, S * dh, S * dh, S * S, B * H); }), 3 * 8},
+      {"matmul_backward BSxd*dxd",
+       time_ms([&] { gpu_matmul_backward(h, y, x, w, z, dw, BS, d, d); }), 4 * 8},
+      {"matmul_backward BSxd*dxff",
+       time_ms([&] { gpu_matmul_backward(h, y, x, w, z, dw, BS, d, ff); }), 2 * 8},
+      {"attn scores batched (QK^T)", time_ms([&] {
+         gpu_matmul_strided_batched_bt(h, scores, x, y, S, dh, S, S * dh, S * dh, S * S, B * H);
+       }),
+       3 * 8},
       {"softmax attention rows", time_ms([&] { gpu_softmax(scores2, scores, B * H * S, S); }), 8},
-      {"softmax_backward attention", time_ms([&] { gpu_softmax_backward(scores2, scores, scores, B * H * S, S); }), 8},
+      {"softmax_backward attention",
+       time_ms([&] { gpu_softmax_backward(scores2, scores, scores, B * H * S, S); }), 8},
       {"layernorm fwd", time_ms([&] { gpu_layernorm(y, x, vec, vec2, BS, d); }), 17},
-      {"layernorm_backward (atomics)", time_ms([&] { gpu_layernorm_backward(z, dw, dw + d, y, x, vec, BS, d); }), 17},
+      {"layernorm_backward (atomics)",
+       time_ms([&] { gpu_layernorm_backward(z, dw, dw + d, y, x, vec, BS, d); }), 17},
       {"reduce_rows (bias grad) d=512", time_ms([&] { gpu_reduce_rows(vec2, y, BS, d); }), 6 * 8},
       {"reduce_rows (bias grad) ff", time_ms([&] { gpu_reduce_rows(vec2, y, BS, ff); }), 8},
       {"gelu fwd", time_ms([&] { gpu_gelu(y, x, BS * ff); }), 8},
-      {"cross_entropy (alloc+sync)", time_ms([&] { gpu_cross_entropy_loss(dlogits, logits, targets, BS, V); }), 1},
+      {"cross_entropy (alloc+sync)",
+       time_ms([&] { gpu_cross_entropy_loss(dlogits, logits, targets, BS, V); }), 1},
       {"gradient_norm 25.5M (alloc+sync)", time_ms([&] { gpu_gradient_norm(x, 25547776 / 4); }), 1},
       {"add_vectors BSxd", time_ms([&] { gpu_add_vectors(y, x, z, BS * d); }), 6 * 8},
       {"split_heads", time_ms([&] { gpu_split_heads(y, x, B, S, H, dh); }), 6 * 8},
@@ -86,10 +94,11 @@ TEST(Bench, DISABLED_OpTimings) {
   }
   std::printf("%-36s %27.2f\n", "sum of listed ops", total);
 
-  for (void* p : {static_cast<void*>(x), static_cast<void*>(y), static_cast<void*>(z),
-                  static_cast<void*>(w), static_cast<void*>(dw), static_cast<void*>(vec),
-                  static_cast<void*>(vec2), static_cast<void*>(scores), static_cast<void*>(scores2),
-                  static_cast<void*>(logits), static_cast<void*>(dlogits), static_cast<void*>(targets)}) {
+  for (void* p :
+       {static_cast<void*>(x), static_cast<void*>(y), static_cast<void*>(z), static_cast<void*>(w),
+        static_cast<void*>(dw), static_cast<void*>(vec), static_cast<void*>(vec2),
+        static_cast<void*>(scores), static_cast<void*>(scores2), static_cast<void*>(logits),
+        static_cast<void*>(dlogits), static_cast<void*>(targets)}) {
     gpu_free(p);
   }
   cublasDestroy(h);
@@ -125,9 +134,9 @@ TEST(Bench, DISABLED_TrainingStepBreakdown) {
   }
   model.training = true;
   model.dropout_rate = 0.1f;
-  for (auto [p, name] : {std::pair{MatmulPrecision::FP32, "fp32"},
-                         std::pair{MatmulPrecision::TF32, "tf32"},
-                         std::pair{MatmulPrecision::BF16, "bf16"}}) {
+  for (auto [p, name] :
+       {std::pair{MatmulPrecision::FP32, "fp32"}, std::pair{MatmulPrecision::TF32, "tf32"},
+        std::pair{MatmulPrecision::BF16, "bf16"}}) {
     gpu_set_matmul_precision(p);
     float fwd = time_ms([&] { model_forward(model, tokens.data(), B, S); }, 5);
     ce();
@@ -136,15 +145,21 @@ TEST(Bench, DISABLED_TrainingStepBreakdown) {
   }
   gpu_set_matmul_precision(MatmulPrecision::FP32);
   std::printf("zero activations + grad activations (%.2f GB): %.1f ms\n",
-              2.0 * model.act_offsets.total * 4 / 1e9, time_ms([&] {
-                gpu_zero(model.activations, model.act_offsets.total);
-                gpu_zero(model.grad_activations, model.act_offsets.total);
-              }, 5));
+              2.0 * model.act_offsets.total * 4 / 1e9,
+              time_ms(
+                  [&] {
+                    gpu_zero(model.activations, model.act_offsets.total);
+                    gpu_zero(model.grad_activations, model.act_offsets.total);
+                  },
+                  5));
   std::printf("zero_grad: %.1f ms\n", time_ms([&] { model_zero_grad(model); }, 5));
-  std::printf("adamw step: %.1f ms\n", time_ms([&] {
-                gpu_adamw_step(model.params, model.gradients, m, v, model.decay_flags, n, 1e-4f,
-                               0.9f, 0.95f, 1e-8f, 0.1f, 1);
-              }, 5));
+  std::printf("adamw step: %.1f ms\n", time_ms(
+                                           [&] {
+                                             gpu_adamw_step(model.params, model.gradients, m, v,
+                                                            model.decay_flags, n, 1e-4f, 0.9f,
+                                                            0.95f, 1e-8f, 0.1f, 1);
+                                           },
+                                           5));
   gpu_free(m);
   gpu_free(v);
   gpu_free(d_targets);
@@ -175,9 +190,10 @@ TEST(Bench, DISABLED_FusedVsMaterializedAttention) {
       float bwd = time_ms([&] { model_backward(model, tokens.data(), B, S); }, 3);
       size_t free_b = 0, total_b = 0;
       CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-      std::printf("%-9s B=%-2d S=%-4d %-12s forward %7.1f ms  backward %7.1f ms  GPU mem used %.2f GB\n",
-                  preset, B, S, materialized ? "materialized" : "fused", fwd, bwd,
-                  (total_b - free_b) / 1e9);
+      std::printf(
+          "%-9s B=%-2d S=%-4d %-12s forward %7.1f ms  backward %7.1f ms  GPU mem used %.2f GB\n",
+          preset, B, S, materialized ? "materialized" : "fused", fwd, bwd,
+          (total_b - free_b) / 1e9);
       model_free(model);
     }
     gpu_free(d_targets);

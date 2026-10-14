@@ -32,12 +32,10 @@ nlohmann::json load_fixture() {
   return nlohmann::json::parse(f);
 }
 
-std::vector<uint16_t> to_ids(const nlohmann::json& j) {
-  return j.get<std::vector<uint16_t>>();
-}
+std::vector<uint16_t> to_ids(const nlohmann::json& j) { return j.get<std::vector<uint16_t>>(); }
 
-#define REQUIRE_GPT2_FILE(name)                                                       \
-  if (!std::filesystem::exists(gpt2_dir() / (name))) {                                \
+#define REQUIRE_GPT2_FILE(name)                                                         \
+  if (!std::filesystem::exists(gpt2_dir() / (name))) {                                  \
     GTEST_SKIP() << (gpt2_dir() / (name)).string() << " not found (see test_gpt2.cpp)"; \
   }
 

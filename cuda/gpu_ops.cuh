@@ -7,23 +7,22 @@
 #include <stdexcept>
 #include <string>
 
-#define CUDA_CHECK(call)                                                    \
-  do {                                                                      \
-    cudaError_t err = (call);                                               \
-    if (err != cudaSuccess) {                                               \
-      throw std::runtime_error(std::string("CUDA error: ") +               \
-                               cudaGetErrorString(err) + " at " __FILE__ + \
-                               ":" + std::to_string(__LINE__));             \
-    }                                                                       \
+#define CUDA_CHECK(call)                                                               \
+  do {                                                                                 \
+    cudaError_t err = (call);                                                          \
+    if (err != cudaSuccess) {                                                          \
+      throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err) + \
+                               " at " __FILE__ + ":" + std::to_string(__LINE__));      \
+    }                                                                                  \
   } while (0)
 
-#define CUBLAS_CHECK(call)                                                     \
-  do {                                                                         \
-    cublasStatus_t status = (call);                                            \
-    if (status != CUBLAS_STATUS_SUCCESS) {                                     \
+#define CUBLAS_CHECK(call)                                                    \
+  do {                                                                        \
+    cublasStatus_t status = (call);                                           \
+    if (status != CUBLAS_STATUS_SUCCESS) {                                    \
       throw std::runtime_error(std::string("cuBLAS error at " __FILE__ ":") + \
-                               std::to_string(__LINE__));                      \
-    }                                                                          \
+                               std::to_string(__LINE__));                     \
+    }                                                                         \
   } while (0)
 
 // --- Memory helpers ---
@@ -85,19 +84,16 @@ void gpu_embedding_backward(float* dtable, const float* dout, const uint16_t* to
 // --- Batched strided cuBLAS ---
 // C[i] = A[i] × B[i]^T for i in [0, batch_count), each A is (M×K), B is (N×K), C is (M×N)
 void gpu_matmul_strided_batched_bt(cublasHandle_t handle, float* out, const float* a,
-                                   const float* b, int M, int K, int N,
-                                   long long strideA, long long strideB, long long strideC,
-                                   int batch_count);
+                                   const float* b, int M, int K, int N, long long strideA,
+                                   long long strideB, long long strideC, int batch_count);
 // C[i] = A[i] × B[i] for i in [0, batch_count), each A is (M×K), B is (K×N), C is (M×N)
-void gpu_matmul_strided_batched(cublasHandle_t handle, float* out, const float* a,
-                                const float* b, int M, int K, int N,
-                                long long strideA, long long strideB, long long strideC,
-                                int batch_count);
+void gpu_matmul_strided_batched(cublasHandle_t handle, float* out, const float* a, const float* b,
+                                int M, int K, int N, long long strideA, long long strideB,
+                                long long strideC, int batch_count);
 // C[i] += A[i]^T × B[i] (accumulate), each A is (K×M), B is (K×N), C is (M×N)
 void gpu_matmul_strided_batched_at(cublasHandle_t handle, float* out, const float* a,
-                                   const float* b, int M, int K, int N,
-                                   long long strideA, long long strideB, long long strideC,
-                                   int batch_count);
+                                   const float* b, int M, int K, int N, long long strideA,
+                                   long long strideB, long long strideC, int batch_count);
 
 // --- Attention helpers ---
 // Reshape [B*S, D] → [B*H, S, dh] (split heads with batch)
@@ -120,10 +116,10 @@ bool gpu_flash_attention_supported(int d_head);
 void gpu_flash_attention_forward(float* out, float* lse, const float* q, const float* k,
                                  const float* v, int BH, int S, int d_head, float scale);
 // Writes (does not accumulate) dq, dk, dv. delta: [BH, S] scratch.
-void gpu_flash_attention_backward(float* dq, float* dk, float* dv, float* delta,
-                                  const float* dout, const float* out, const float* lse,
-                                  const float* q, const float* k, const float* v, int BH, int S,
-                                  int d_head, float scale);
+void gpu_flash_attention_backward(float* dq, float* dk, float* dv, float* delta, const float* dout,
+                                  const float* out, const float* lse, const float* q,
+                                  const float* k, const float* v, int BH, int S, int d_head,
+                                  float scale);
 
 // --- Dropout kernels ---
 // Initialize cuRAND states (call once)
@@ -140,6 +136,6 @@ void gpu_adamw_step(float* params, const float* grads, float* m, float* v,
                     const uint8_t* decay_flags, size_t num_params, float lr, float beta1,
                     float beta2, float eps, float weight_decay, int step);
 void gpu_adam_step(float* params, const float* grads, float* m, float* v, size_t num_params,
-                  float lr, float beta1, float beta2, float eps, int step);
+                   float lr, float beta1, float beta2, float eps, int step);
 float gpu_gradient_norm(const float* grads, size_t num_params);
 void gpu_gradient_scale(float* grads, size_t num_params, float scale);

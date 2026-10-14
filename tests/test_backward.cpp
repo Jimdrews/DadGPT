@@ -231,7 +231,7 @@ TEST(Backward, GpuSoftmaxRowsSumToOne) {
 // With dropout, every forward re-seeds the RNG so all passes see identical masks and the
 // loss stays a deterministic, smooth function of the parameters.
 void full_model_gradient_check(float dropout_rate, int d_model = 16,
-                                AttentionImpl attention = AttentionImpl::Auto) {
+                               AttentionImpl attention = AttentionImpl::Auto) {
   ModelConfig config = tiny_config(2, d_model);
   Model model{};
   model_alloc(model, config);
@@ -417,8 +417,8 @@ TEST(Backward, OverfitsSingleBatch) {
     loss = forward_loss(model, tokens, d_targets, 1, 8);
     if (step == 1) first = loss;
     model_backward(model, tokens, 1, 8);
-    gpu_adamw_step(model.params, model.gradients, m, v, model.decay_flags, n, 3e-3f, 0.9f,
-                   0.95f, 1e-8f, 0.0f, step);
+    gpu_adamw_step(model.params, model.gradients, m, v, model.decay_flags, n, 3e-3f, 0.9f, 0.95f,
+                   1e-8f, 0.0f, step);
   }
   EXPECT_GT(first, 2.0f);
   EXPECT_LT(loss, 0.05f) << "loss went " << first << " -> " << loss;

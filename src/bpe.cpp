@@ -136,8 +136,8 @@ void BPE::train(const std::string& text, int vocab_size) {
     ++current_vocab_size;
 
     if ((current_vocab_size - 260) % 500 == 0) {
-      std::cout << "  BPE merges: " << (current_vocab_size - 260) << " / "
-                << (vocab_size - 260) << "\n";
+      std::cout << "  BPE merges: " << (current_vocab_size - 260) << " / " << (vocab_size - 260)
+                << "\n";
     }
   }
 }

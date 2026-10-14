@@ -25,8 +25,7 @@ class BPE {
  private:
   struct PairHash {
     size_t operator()(const std::pair<uint16_t, uint16_t>& p) const {
-      return std::hash<uint32_t>{}(
-          (static_cast<uint32_t>(p.first) << 16) | p.second);
+      return std::hash<uint32_t>{}((static_cast<uint32_t>(p.first) << 16) | p.second);
     }
   };
 

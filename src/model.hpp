@@ -48,18 +48,18 @@ struct ActivationOffsets {
 
   struct LayerActivations {
     size_t ln1_out;
-    size_t q, k, v;              // [seq_len × d_model] (after projection)
+    size_t q, k, v;                    // [seq_len × d_model] (after projection)
     size_t q_heads, k_heads, v_heads;  // [n_heads × seq_len × d_head] (reshaped for cuBLAS)
-    size_t attn_lse;             // [B*H × seq_len] softmax row logsumexps (fused path)
-    size_t attn_out_heads;       // [n_heads × seq_len × d_head]
-    size_t attn_out;             // [seq_len × d_model] (reshaped back)
-    size_t attn_proj;            // [seq_len × d_model]
-    size_t residual1;            // [seq_len × d_model]
+    size_t attn_lse;                   // [B*H × seq_len] softmax row logsumexps (fused path)
+    size_t attn_out_heads;             // [n_heads × seq_len × d_head]
+    size_t attn_out;                   // [seq_len × d_model] (reshaped back)
+    size_t attn_proj;                  // [seq_len × d_model]
+    size_t residual1;                  // [seq_len × d_model]
     size_t ln2_out;
-    size_t fc1_out;              // [seq_len × d_ff]
-    size_t gelu_out;             // [seq_len × d_ff]
-    size_t fc2_out;              // [seq_len × d_model]
-    size_t residual2;            // [seq_len × d_model]
+    size_t fc1_out;    // [seq_len × d_ff]
+    size_t gelu_out;   // [seq_len × d_ff]
+    size_t fc2_out;    // [seq_len × d_model]
+    size_t residual2;  // [seq_len × d_model]
   };
 
   // Dropout mask offsets (uint8, separate buffer from float activations). Attention
@@ -69,8 +69,8 @@ struct ActivationOffsets {
     size_t mlp;        // after MLP fc2
   };
   std::vector<DropoutMasks> drop_masks;
-  size_t drop_emb;       // embedding dropout mask
-  size_t drop_total;     // total uint8 mask elements
+  size_t drop_emb;    // embedding dropout mask
+  size_t drop_total;  // total uint8 mask elements
   std::vector<LayerActivations> layers;
 
   size_t lnf_out;

@@ -74,8 +74,7 @@ __global__ void flash_fwd_kernel(float* __restrict__ out, float* __restrict__ ls
 
 // delta[r] = sum_d dout[r, d] * out[r, d]  (the softmax-backward row term)
 template <int D>
-__global__ void flash_delta_kernel(float* delta, const float* dout, const float* out,
-                                   int rows) {
+__global__ void flash_delta_kernel(float* delta, const float* dout, const float* out, int rows) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= rows) return;
   float sum = 0.0f;
@@ -94,7 +93,7 @@ __global__ void flash_bwd_dkdv_kernel(float* __restrict__ dk, float* __restrict_
                                       const float* __restrict__ delta, int S, float scale) {
   __shared__ float kj_s[kCols][D + 1];  // +1 pad: each thread reads its own row
   __shared__ float vj_s[kCols][D + 1];
-  __shared__ float qs[kRows][D];        // broadcast reads: no pad needed
+  __shared__ float qs[kRows][D];  // broadcast reads: no pad needed
   __shared__ float dos[kRows][D];
   __shared__ float lse_s[kRows], delta_s[kRows];
 
@@ -206,8 +205,8 @@ __global__ void flash_bwd_dq_kernel(float* __restrict__ dq, const float* __restr
 }
 
 template <int D>
-void launch_forward(float* out, float* lse, const float* q, const float* k, const float* v,
-                    int BH, int S, float scale) {
+void launch_forward(float* out, float* lse, const float* q, const float* k, const float* v, int BH,
+                    int S, float scale) {
   dim3 grid((S + kRows - 1) / kRows, BH);
   flash_fwd_kernel<D><<<grid, kRows>>>(out, lse, q, k, v, S, scale);
   CUDA_CHECK(cudaGetLastError());
@@ -239,10 +238,10 @@ void gpu_flash_attention_forward(float* out, float* lse, const float* q, const f
   throw std::runtime_error("flash attention: unsupported d_head " + std::to_string(d_head));
 }
 
-void gpu_flash_attention_backward(float* dq, float* dk, float* dv, float* delta,
-                                  const float* dout, const float* out, const float* lse,
-                                  const float* q, const float* k, const float* v, int BH, int S,
-                                  int d_head, float scale) {
+void gpu_flash_attention_backward(float* dq, float* dk, float* dv, float* delta, const float* dout,
+                                  const float* out, const float* lse, const float* q,
+                                  const float* k, const float* v, int BH, int S, int d_head,
+                                  float scale) {
   if (d_head == 64) {
     return launch_backward<64>(dq, dk, dv, delta, dout, out, lse, q, k, v, BH, S, scale);
   }

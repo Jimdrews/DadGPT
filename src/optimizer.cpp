@@ -29,7 +29,8 @@ float adam_lr(const Adam& opt) {
   float progress =
       static_cast<float>(opt.step - opt.warmup_steps) / static_cast<float>(decay_steps);
   if (progress > 1.0f) progress = 1.0f;
-  return min_lr + 0.5f * (opt.max_lr - min_lr) * (1.0f + std::cos(std::numbers::pi_v<float> * progress));
+  return min_lr +
+         0.5f * (opt.max_lr - min_lr) * (1.0f + std::cos(std::numbers::pi_v<float> * progress));
 }
 
 void adam_step(Adam& opt, float* params, const float* grads) {

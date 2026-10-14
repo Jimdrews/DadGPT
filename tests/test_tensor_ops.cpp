@@ -109,8 +109,8 @@ TEST(TensorOps, GeluKnownValues) {
   gelu(out, in, 3);
 
   EXPECT_NEAR(out[0], 0.0f, 1e-5);
-  EXPECT_NEAR(out[1], 3.0f, 0.01f);   // large positive ≈ input
-  EXPECT_NEAR(out[2], 0.0f, 0.01f);   // large negative ≈ 0
+  EXPECT_NEAR(out[1], 3.0f, 0.01f);  // large positive ≈ input
+  EXPECT_NEAR(out[2], 0.0f, 0.01f);  // large negative ≈ 0
 }
 
 TEST(TensorOps, EmbeddingLookup) {

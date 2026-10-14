@@ -158,24 +158,26 @@ void run_training(const TrainConfig& tc) {
   size_t tokens_per_step = batch_tokens * static_cast<size_t>(tc.accumulation_steps);
   int max_steps = tc.max_steps;
   if (max_steps <= 0) {
-    max_steps = static_cast<int>(std::ceil(tc.epochs * static_cast<double>(train_loader.num_tokens()) /
-                                           static_cast<double>(tokens_per_step)));
+    max_steps =
+        static_cast<int>(std::ceil(tc.epochs * static_cast<double>(train_loader.num_tokens()) /
+                                   static_cast<double>(tokens_per_step)));
   }
   opt.total_steps = std::max(max_steps, 1);
 
-  std::cout << std::format("Model: {} params, d_model={}, n_layers={}, n_heads={}, ctx={}, "
-                           "vocab={} ({})\n",
-                           model.param_offsets.total, mc.d_model, mc.n_layers, mc.n_heads,
-                           mc.ctx_len, mc.vocab_size, meta.tokenizer);
+  std::cout << std::format(
+      "Model: {} params, d_model={}, n_layers={}, n_heads={}, ctx={}, "
+      "vocab={} ({})\n",
+      model.param_offsets.total, mc.d_model, mc.n_layers, mc.n_heads, mc.ctx_len, mc.vocab_size,
+      meta.tokenizer);
   std::cout << std::format("Train tokens: {}, Val tokens: {}\n", train_loader.num_tokens(),
                            val_tokens);
-  std::cout << std::format("Batch {} x {} x accum {} = {} tokens/step, {} steps "
-                           "({:.2f} epochs), lr {} warmup {}\n\n",
-                           tc.batch_size, seq_len, tc.accumulation_steps, tokens_per_step,
-                           max_steps,
-                           static_cast<double>(max_steps) * tokens_per_step /
-                               static_cast<double>(train_loader.num_tokens()),
-                           tc.max_lr, tc.warmup_steps);
+  std::cout << std::format(
+      "Batch {} x {} x accum {} = {} tokens/step, {} steps "
+      "({:.2f} epochs), lr {} warmup {}\n\n",
+      tc.batch_size, seq_len, tc.accumulation_steps, tokens_per_step, max_steps,
+      static_cast<double>(max_steps) * tokens_per_step /
+          static_cast<double>(train_loader.num_tokens()),
+      tc.max_lr, tc.warmup_steps);
 
   if (opt.step >= max_steps) {
     std::cout << std::format("Already trained to step {} (max_steps {}).\n", opt.step, max_steps);
@@ -235,8 +237,8 @@ void run_training(const TrainConfig& tc) {
     ++opt.step;
     float lr = adam_lr(opt);
     gpu_adamw_step(model.params, model.gradients, opt.m, opt.v, model.decay_flags,
-                   model.param_offsets.total, lr, opt.beta1, opt.beta2, opt.eps,
-                   opt.weight_decay, opt.step);
+                   model.param_offsets.total, lr, opt.beta1, opt.beta2, opt.eps, opt.weight_decay,
+                   opt.step);
 
     interval_loss += step_loss;
     ++interval_steps;
@@ -246,8 +248,8 @@ void run_training(const TrainConfig& tc) {
       // instead of failing, which silently makes training several times slower.
       size_t free_b = 0, total_b = 0;
       gpu_memory_info(free_b, total_b);
-      std::cout << std::format("  GPU memory: {:.2f} / {:.2f} GB used\n",
-                               (total_b - free_b) / 1e9, total_b / 1e9);
+      std::cout << std::format("  GPU memory: {:.2f} / {:.2f} GB used\n", (total_b - free_b) / 1e9,
+                               total_b / 1e9);
       if (free_b < total_b / 50) {
         std::cerr << "  warning: GPU memory is (nearly) full. If the driver spills to system "
                      "RAM, training slows down sharply; reduce --batch or use --attention fused.\n";

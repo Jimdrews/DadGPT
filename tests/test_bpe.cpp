@@ -37,8 +37,7 @@ TEST(BPE, EncodeDecodeRoundTripVariousTexts) {
       "I used to hate facial hair, but then it grew on me.";
   bpe.train(corpus, 300);
 
-  for (const auto& text :
-       {"chicken", "the road", "impasta", "facial hair", "hello"}) {
+  for (const auto& text : {"chicken", "the road", "impasta", "facial hair", "hello"}) {
     auto tokens = bpe.encode(text);
     EXPECT_EQ(bpe.decode(tokens), text) << "Failed round-trip for: " << text;
   }

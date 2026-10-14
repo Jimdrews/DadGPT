@@ -57,8 +57,8 @@ uint16_t sample_token(std::vector<float> logits, const std::vector<uint16_t>& hi
   // Top-k filtering: keep probabilities >= the k-th largest (ties at the boundary are kept)
   if (top_k > 0 && top_k < vocab_size) {
     std::vector<float> sorted_probs = logits;
-    std::nth_element(sorted_probs.begin(), sorted_probs.begin() + (top_k - 1),
-                     sorted_probs.end(), std::greater<>());
+    std::nth_element(sorted_probs.begin(), sorted_probs.begin() + (top_k - 1), sorted_probs.end(),
+                     std::greater<>());
     float threshold = sorted_probs[top_k - 1];
 
     float filtered_sum = 0.0f;
@@ -92,8 +92,8 @@ uint16_t sample_token(std::vector<float> logits, const std::vector<uint16_t>& hi
 }
 
 std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>& seed,
-                                      float temperature, int top_k, int max_len,
-                                      float rep_penalty, int stop_token) {
+                                      float temperature, int top_k, int max_len, float rep_penalty,
+                                      int stop_token) {
   int ctx_len = model.config.ctx_len;
   max_len = std::min(max_len, ctx_len);
 
@@ -217,8 +217,8 @@ std::unique_ptr<TextCodec> make_codec(const DatasetMeta& meta, const std::string
 
 std::string generate_text(Model& model, const TextCodec& codec, const GenerateConfig& config) {
   int max_len = config.max_len > 0 ? config.max_len : model.config.ctx_len;
-  auto tokens = generate_tokens(model, codec.seed(config.prompt), config.temperature,
-                                config.top_k, max_len, config.rep_penalty, codec.stop_token());
+  auto tokens = generate_tokens(model, codec.seed(config.prompt), config.temperature, config.top_k,
+                                max_len, config.rep_penalty, codec.stop_token());
   return codec.render(tokens);
 }
 

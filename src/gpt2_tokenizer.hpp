@@ -32,10 +32,10 @@ class Gpt2Tokenizer {
   // Applies the BPE merges to one pre-token given as mapped unicode symbols
   void bpe(const std::vector<std::string>& symbols, std::vector<uint16_t>& out) const;
 
-  std::array<std::string, 256> byte_encoder_;              // byte -> UTF-8 of its symbol
-  std::unordered_map<std::string, int> encoder_;           // symbol string -> id
-  std::vector<std::string> decoder_;                       // id -> raw bytes
-  std::unordered_map<std::string, int> merge_ranks_;       // "left right" -> rank
+  std::array<std::string, 256> byte_encoder_;         // byte -> UTF-8 of its symbol
+  std::unordered_map<std::string, int> encoder_;      // symbol string -> id
+  std::vector<std::string> decoder_;                  // id -> raw bytes
+  std::unordered_map<std::string, int> merge_ranks_;  // "left right" -> rank
   // Pre-token -> ids. Mutable cache: encode() is logically const but not thread-safe.
   mutable std::unordered_map<std::string, std::vector<uint16_t>> cache_;
   struct Regex;

@@ -152,8 +152,7 @@ DataLoader& DataLoader::operator=(DataLoader&& other) noexcept {
 
 bool DataLoader::has_next() const {
   // Need seq_len + 1 tokens per sequence (for the shifted target)
-  size_t tokens_per_batch =
-      static_cast<size_t>(batch_size_) * static_cast<size_t>(seq_len_ + 1);
+  size_t tokens_per_batch = static_cast<size_t>(batch_size_) * static_cast<size_t>(seq_len_ + 1);
   return cursor_ + tokens_per_batch <= num_tokens_;
 }
 

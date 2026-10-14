@@ -69,9 +69,9 @@ struct Gpt2Tokenizer::Regex {
 Gpt2Tokenizer::Gpt2Tokenizer() : regex_(std::make_unique<Regex>()) {
   int err = 0;
   PCRE2_SIZE err_offset = 0;
-  regex_->code = pcre2_compile(reinterpret_cast<PCRE2_SPTR>(kPattern), PCRE2_ZERO_TERMINATED,
-                               PCRE2_UTF | PCRE2_UCP | PCRE2_MATCH_INVALID_UTF, &err,
-                               &err_offset, nullptr);
+  regex_->code =
+      pcre2_compile(reinterpret_cast<PCRE2_SPTR>(kPattern), PCRE2_ZERO_TERMINATED,
+                    PCRE2_UTF | PCRE2_UCP | PCRE2_MATCH_INVALID_UTF, &err, &err_offset, nullptr);
   if (!regex_->code) {
     PCRE2_UCHAR msg[256];
     pcre2_get_error_message(err, msg, sizeof(msg));
@@ -128,8 +128,7 @@ void Gpt2Tokenizer::load(const std::string& vocab_json_path, const std::string& 
   cache_.clear();
 }
 
-void Gpt2Tokenizer::bpe(const std::vector<std::string>& symbols,
-                        std::vector<uint16_t>& out) const {
+void Gpt2Tokenizer::bpe(const std::vector<std::string>& symbols, std::vector<uint16_t>& out) const {
   std::vector<std::string> word = symbols;
   // Repeatedly merge the lowest-ranked adjacent pair (all its occurrences, left to right),
   // exactly as OpenAI's encoder.py does

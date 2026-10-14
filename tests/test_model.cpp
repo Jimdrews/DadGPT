@@ -3,9 +3,9 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <numeric>
 #include <stdexcept>
 #include <string>
-#include <numeric>
 #include <vector>
 
 #include "gpu_ops.cuh"
@@ -145,8 +145,7 @@ TEST(Model, FusedBiasAdd) {
   for (int r = 0; r < rows; ++r) {
     for (int c = 0; c < cols; ++c) {
       float expected = h_data[r * cols + c] + h_bias[c];
-      EXPECT_NEAR(result[r * cols + c], expected, 1e-5)
-          << "Mismatch at (" << r << "," << c << ")";
+      EXPECT_NEAR(result[r * cols + c], expected, 1e-5) << "Mismatch at (" << r << "," << c << ")";
     }
   }
 

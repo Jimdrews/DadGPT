@@ -57,8 +57,7 @@ TEST(DataLoader, TargetsAreShiftedInputs) {
 
   // Verify shift: targets[j] == tokens[j] + 10 (because source is 10,20,30,...)
   for (int j = 0; j < 4; ++j) {
-    EXPECT_EQ(batch.targets[j], batch.tokens[j] + 10)
-        << "Shift mismatch at position " << j;
+    EXPECT_EQ(batch.targets[j], batch.tokens[j] + 10) << "Shift mismatch at position " << j;
   }
 
   std::remove(path.c_str());
