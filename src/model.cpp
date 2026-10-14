@@ -827,6 +827,32 @@ void model_forward_cached(Model& model, KVCache& cache, uint16_t token, int pos)
   cache.length = pos + 1;
 }
 
+void model_prefill(Model& model, KVCache& cache, const uint16_t* tokens, int n) {
+  const auto& c = model.config;
+  if (n < 1 || n > cache.max_len) throw std::out_of_range("model_prefill: bad prompt length");
+  model_forward(model, tokens, 1, n);
+
+  // k_heads / v_heads are [H, n, dh] for batch 1; the cache is [H, max_len, dh] per layer
+  int dh = c.d_head();
+  size_t row_bytes = static_cast<size_t>(n) * dh * sizeof(float);
+  for (int l = 0; l < c.n_layers; ++l) {
+    const auto& la = model.act_offsets.layers[l];
+    CUDA_CHECK(cudaMemcpy2D(cache.k_cache[l], static_cast<size_t>(cache.max_len) * dh * 4,
+                            model.act(la.k_heads), row_bytes, row_bytes, c.n_heads,
+                            cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy2D(cache.v_cache[l], static_cast<size_t>(cache.max_len) * dh * 4,
+                            model.act(la.v_heads), row_bytes, row_bytes, c.n_heads,
+                            cudaMemcpyDeviceToDevice));
+  }
+  // The last position's logits go to row 0, where generation reads them
+  float* logits = model.act(model.act_offsets.logits);
+  if (n > 1) {
+    CUDA_CHECK(cudaMemcpy(logits, logits + static_cast<size_t>(n - 1) * c.vocab_size,
+                          c.vocab_size * sizeof(float), cudaMemcpyDeviceToDevice));
+  }
+  cache.length = n;
+}
+
 void model_save(const Model& model, const std::string& path) {
   std::ofstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("Cannot write " + path);

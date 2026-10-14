@@ -372,3 +372,44 @@ TEST(Model, PresetsMatchGpt2Shapes) {
   model_free(model);
   EXPECT_THROW(model_preset("gpt5"), std::invalid_argument);
 }
+
+TEST(Model, PrefillThenCachedMatchesFullForward) {
+  // Batched prefill of a prompt, then incremental decoding, must match the full forward pass
+  ModelConfig config;
+  config.d_model = 64;
+  config.n_layers = 2;
+  config.n_heads = 2;
+  config.d_ff = 128;
+  config.ctx_len = 24;
+  config.vocab_size = 100;
+
+  Model model{};
+  model_alloc(model, config);
+  model.training = false;
+  std::vector<uint16_t> tokens = {4, 17, 33, 4, 90, 12, 55, 61, 2, 8, 8, 70, 1, 99, 5, 40, 3, 3, 9};
+  int n = static_cast<int>(tokens.size()), prompt = 11;
+
+  model_forward(model, tokens.data(), 1, n);
+  std::vector<float> full(static_cast<size_t>(n) * config.vocab_size);
+  gpu_copy_to_host(full.data(), model.act(model.act_offsets.logits), full.size());
+
+  KVCache cache;
+  kv_cache_alloc(cache, config);
+  std::vector<float> step(config.vocab_size);
+  auto check_row = [&](int pos) {
+    gpu_copy_to_host(step.data(), model.act(model.act_offsets.logits), step.size());
+    for (int v = 0; v < config.vocab_size; ++v) {
+      ASSERT_NEAR(step[v], full[static_cast<size_t>(pos) * config.vocab_size + v], 1e-4)
+          << "pos " << pos << " vocab " << v;
+    }
+  };
+  model_prefill(model, cache, tokens.data(), prompt);
+  EXPECT_EQ(cache.length, prompt);
+  check_row(prompt - 1);
+  for (int pos = prompt; pos < n; ++pos) {
+    model_forward_cached(model, cache, tokens[pos], pos);
+    check_row(pos);
+  }
+  kv_cache_free(cache);
+  model_free(model);
+}

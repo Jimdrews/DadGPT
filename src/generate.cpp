@@ -117,10 +117,8 @@ std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>&
   KVCache cache;
   kv_cache_alloc(cache, model.config);
 
-  // Process seed one position at a time to populate cache
-  for (int i = 0; i < static_cast<int>(tokens.size()); ++i) {
-    model_forward_cached(model, cache, tokens[i], i);
-  }
+  // One batched forward pass over the seed populates the cache
+  model_prefill(model, cache, tokens.data(), static_cast<int>(tokens.size()));
 
   while (static_cast<int>(tokens.size()) < max_len) {
     // Copy logits from standard location (set by model_forward_cached)

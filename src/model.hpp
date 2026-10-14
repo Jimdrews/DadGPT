@@ -155,6 +155,11 @@ void kv_cache_free(KVCache& cache);
 // tokens points to the single new token (on host), pos is the position index
 void model_forward_cached(Model& model, KVCache& cache, uint16_t token, int pos);
 
+// Prefill: runs the whole prompt through one batched forward pass, fills cache positions
+// [0, n) from its K/V activations, and leaves the last position's logits where
+// model_forward_cached puts them. Equivalent to n model_forward_cached calls, much faster.
+void model_prefill(Model& model, KVCache& cache, const uint16_t* tokens, int n);
+
 // Save/load with optimizer state
 struct Adam;
 void model_save_with_optimizer(const Model& model, const Adam& opt, const std::string& path);
