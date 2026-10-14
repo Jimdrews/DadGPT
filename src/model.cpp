@@ -6,6 +6,7 @@
 #include <fstream>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "gpu_ops.cuh"
@@ -165,6 +166,15 @@ void init_weights(Model& model) {
   gpu_copy_to_device(model.params, h_params.data(), total);
 }
 
+// Activation buffers are sized for config.batch_size x ctx_len; larger inputs would overflow.
+void check_batch_shape(const ModelConfig& c, int batch_size, int seq_len) {
+  if (batch_size < 1 || batch_size > c.batch_size || seq_len < 1 || seq_len > c.ctx_len) {
+    throw std::out_of_range("batch " + std::to_string(batch_size) + "x" +
+                            std::to_string(seq_len) + " exceeds model buffers " +
+                            std::to_string(c.batch_size) + "x" + std::to_string(c.ctx_len));
+  }
+}
+
 }  // namespace
 
 void model_alloc(Model& model, const ModelConfig& config) {
@@ -261,6 +271,7 @@ void model_forward(Model& model, const uint16_t* tokens, int batch_size, int seq
   auto h = model.cublas_handle;
   int d = c.d_model;
   int BS = batch_size * seq_len;  // flattened batch*seq for row-independent ops
+  check_batch_shape(c, batch_size, seq_len);
 
   // Copy tokens to device
   gpu_copy_u16_to_device(model.d_tokens, tokens, BS);
@@ -391,12 +402,14 @@ void model_backward(Model& model, const uint16_t* tokens, int batch_size, int se
   auto h = model.cublas_handle;
   int d = c.d_model;
   int BS = batch_size * seq_len;
+  check_batch_shape(c, batch_size, seq_len);
 
   // 4. Backward logits: logits = lnf_out × tok_emb^T
   gpu_matmul(h, model.grad_act(ao.lnf_out), model.grad_act(ao.logits), model.param(po.tok_emb),
              BS, c.vocab_size, d);
+  // Accumulate: tok_emb is tied, and grads must also sum across accumulation micro-batches
   gpu_matmul_transposed_a(h, model.grad(po.tok_emb), model.grad_act(ao.logits),
-                          model.act(ao.lnf_out), c.vocab_size, BS, d);
+                          model.act(ao.lnf_out), c.vocab_size, BS, d, /*accumulate=*/true);
 
   // 3. Backward final layernorm
   size_t lnf_in = (c.n_layers > 0) ? ao.layers[c.n_layers - 1].residual2 : ao.embedded;
@@ -594,6 +607,10 @@ void model_forward_cached(Model& model, KVCache& cache, uint16_t token, int pos)
   auto h = model.cublas_handle;
   int d = c.d_model;
   int dh = c.d_head();
+  if (pos < 0 || pos >= c.ctx_len || pos >= cache.max_len) {
+    throw std::out_of_range("model_forward_cached: pos " + std::to_string(pos) +
+                            " outside context length " + std::to_string(c.ctx_len));
+  }
 
   // We use small scratch buffers from model.activations for single-position computation.
   // The activation buffer is big enough (sized for batch*ctx_len), so we use the first row.
@@ -740,23 +757,39 @@ void model_save(const Model& model, const std::string& path) {
           static_cast<std::streamsize>(num_params * sizeof(float)));
 }
 
-void model_load(Model& model, const std::string& path) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("Cannot read " + path);
+namespace {
 
+// Reads config + params from an open checkpoint stream and allocates the model.
+// batch_size > 0 overrides the saved batch size (activation buffers are sized from it).
+void read_checkpoint_params(Model& model, std::ifstream& f, const std::string& path,
+                            int batch_size) {
   ModelConfig config{};
   f.read(reinterpret_cast<char*>(&config), sizeof(ModelConfig));
+  if (!f) throw std::runtime_error("Truncated checkpoint header in " + path);
+  if (batch_size > 0) config.batch_size = batch_size;
 
   model_alloc(model, config);
 
   uint64_t num_params = 0;
   f.read(reinterpret_cast<char*>(&num_params), sizeof(num_params));
+  if (!f || num_params != model.param_offsets.total) {
+    throw std::runtime_error("Checkpoint " + path + " param count does not match its config");
+  }
 
   // Read to host buffer, then copy to GPU
   std::vector<float> h_params(num_params);
   f.read(reinterpret_cast<char*>(h_params.data()),
          static_cast<std::streamsize>(num_params * sizeof(float)));
+  if (!f) throw std::runtime_error("Truncated checkpoint params in " + path);
   gpu_copy_to_device(model.params, h_params.data(), num_params);
+}
+
+}  // namespace
+
+void model_load(Model& model, const std::string& path, int batch_size) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("Cannot read " + path);
+  read_checkpoint_params(model, f, path, batch_size);
 }
 
 void model_save_with_optimizer(const Model& model, const Adam& opt, const std::string& path) {
@@ -785,31 +818,33 @@ void model_save_with_optimizer(const Model& model, const Adam& opt, const std::s
           static_cast<std::streamsize>(num_params * sizeof(float)));
 }
 
-void model_load_with_optimizer(Model& model, Adam& opt, const std::string& path) {
+void model_load_with_optimizer(Model& model, Adam& opt, const std::string& path,
+                               int batch_size) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("Cannot read " + path);
+  read_checkpoint_params(model, f, path, batch_size);
 
-  ModelConfig config{};
-  f.read(reinterpret_cast<char*>(&config), sizeof(ModelConfig));
-  model_alloc(model, config);
+  size_t num_params = model.param_offsets.total;
+  opt.num_params = num_params;
+  if (!opt.m) opt.m = gpu_alloc(num_params);
+  if (!opt.v) opt.v = gpu_alloc(num_params);
+  gpu_zero(opt.m, num_params);
+  gpu_zero(opt.v, num_params);
+  opt.step = 0;
 
-  uint64_t num_params = 0;
-  f.read(reinterpret_cast<char*>(&num_params), sizeof(num_params));
-  std::vector<float> h_params(num_params);
-  f.read(reinterpret_cast<char*>(h_params.data()),
-         static_cast<std::streamsize>(num_params * sizeof(float)));
-  gpu_copy_to_device(model.params, h_params.data(), num_params);
-
-  // Try to read optimizer state
+  // Optimizer state is optional (weights-only checkpoints end here)
   uint8_t has_opt = 0;
   f.read(reinterpret_cast<char*>(&has_opt), 1);
   if (f && has_opt == 1) {
-    f.read(reinterpret_cast<char*>(&opt.step), sizeof(opt.step));
+    int step = 0;
+    f.read(reinterpret_cast<char*>(&step), sizeof(step));
     std::vector<float> h_m(num_params), h_v(num_params);
     f.read(reinterpret_cast<char*>(h_m.data()),
            static_cast<std::streamsize>(num_params * sizeof(float)));
     f.read(reinterpret_cast<char*>(h_v.data()),
            static_cast<std::streamsize>(num_params * sizeof(float)));
+    if (!f) throw std::runtime_error("Truncated optimizer state in " + path);
+    opt.step = step;
     gpu_copy_to_device(opt.m, h_m.data(), num_params);
     gpu_copy_to_device(opt.v, h_v.data(), num_params);
   }

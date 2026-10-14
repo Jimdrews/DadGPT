@@ -40,9 +40,9 @@ void gpu_zero(float* ptr, size_t count);
 // C = A × B where A is (M×K), B is (K×N), C is (M×N)
 void gpu_matmul(cublasHandle_t handle, float* out, const float* a, const float* b, int M, int K,
                 int N);
-// C = A^T × B
+// C = A^T × B, or C += A^T × B when accumulate is true
 void gpu_matmul_transposed_a(cublasHandle_t handle, float* out, const float* a, const float* b,
-                             int M, int K, int N);
+                             int M, int K, int N, bool accumulate = false);
 // C = A × B^T
 void gpu_matmul_transposed_b(cublasHandle_t handle, float* out, const float* a, const float* b,
                              int M, int K, int N);

@@ -62,8 +62,8 @@ void gpu_matmul(cublasHandle_t handle, float* out, const float* a, const float* 
 
 // Row-major C = A^T × B  where A is (K×M), result is (M×N)
 void gpu_matmul_transposed_a(cublasHandle_t handle, float* out, const float* a, const float* b,
-                             int M, int K, int N) {
-  float alpha = 1.0f, beta = 0.0f;
+                             int M, int K, int N, bool accumulate) {
+  float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
   CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N, a, M, &beta,
                            out, N));
 }
@@ -134,6 +134,7 @@ __global__ void softmax_kernel(float* out, const float* in, int cols) {
     __syncthreads();
   }
   max_val = sdata[0];
+  __syncthreads();  // all threads must read the max before sdata is reused for the sum
 
   // Exp and sum
   float sum = 0.0f;
@@ -320,6 +321,7 @@ __global__ void cross_entropy_kernel(float* dlogits, float* losses, const float*
     __syncthreads();
   }
   max_val = sdata[0];
+  __syncthreads();  // all threads must read the max before sdata is reused for the sum
 
   // Exp and sum (parallel reduction)
   float sum = 0.0f;
@@ -342,9 +344,9 @@ __global__ void cross_entropy_kernel(float* dlogits, float* losses, const float*
   }
   __syncthreads();
 
-  // Loss (single thread reads target probability)
+  // Loss = logsumexp(z) - z[t] = log(sum) - (z[t] - max). Exact even when p[t] underflows.
   if (threadIdx.x == 0) {
-    losses[row] = -logf(row_out[targets[row]] + 1e-10f);
+    losses[row] = logf(sum) - (row_in[targets[row]] - max_val);
   }
 
   // Gradient: softmax - one_hot, averaged over total rows

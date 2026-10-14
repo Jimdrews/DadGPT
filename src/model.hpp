@@ -113,7 +113,8 @@ void model_zero_grad(Model& model);
 
 // Save/load
 void model_save(const Model& model, const std::string& path);
-void model_load(Model& model, const std::string& path);
+// batch_size > 0 sizes activation buffers for that batch instead of the saved one
+void model_load(Model& model, const std::string& path, int batch_size = 0);
 
 // KV cache for autoregressive generation
 struct KVCache {
@@ -137,4 +138,6 @@ void model_forward_cached(Model& model, KVCache& cache, uint16_t token, int pos)
 // Save/load with optimizer state
 struct Adam;
 void model_save_with_optimizer(const Model& model, const Adam& opt, const std::string& path);
-void model_load_with_optimizer(Model& model, Adam& opt, const std::string& path);
+// Allocates opt.m / opt.v if null. Weights-only checkpoints leave the optimizer zeroed.
+void model_load_with_optimizer(Model& model, Adam& opt, const std::string& path,
+                               int batch_size = 0);
