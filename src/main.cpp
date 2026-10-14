@@ -174,6 +174,7 @@ Usage: dad-gpt <command> [options]
     --batch N --accum N       micro-batch size and gradient accumulation steps
     --steps N | --epochs F    optimizer steps, or passes over the training tokens
     --lr F --warmup N --wd F --dropout F --seed N
+    --precision P             matmul precision: bf16 (default) | tf32 | fp32
     --log-every N --eval-every N --eval-batches N --ckpt-every N --keep N
 
   generate                    Sample from a checkpoint
@@ -225,12 +226,16 @@ int run(int argc, char* argv[]) {
                     {"--wd", f(tc.weight_decay)},
                     {"--dropout", f(tc.dropout_rate)},
                     {"--seed", [&](const std::string& v) { tc.seed = std::stoull(v); }},
+                    {"--precision", [&](const std::string& v) { tc.precision = v; }},
                     {"--log-every", i(tc.log_interval)},
                     {"--eval-every", i(tc.eval_interval)},
                     {"--eval-batches", i(tc.eval_batches)},
                     {"--ckpt-every", i(tc.checkpoint_interval)},
                     {"--keep", i(tc.keep_checkpoints)},
                 });
+    if (tc.precision != "bf16" && tc.precision != "tf32" && tc.precision != "fp32") {
+      throw std::invalid_argument("--precision must be bf16, tf32 or fp32");
+    }
     if (tc.dropout_rate < 0.0f || tc.dropout_rate >= 1.0f) {
       throw std::invalid_argument("--dropout must be in [0, 1)");
     }

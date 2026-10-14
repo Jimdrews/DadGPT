@@ -1,5 +1,6 @@
 #include "gpu_ops.cuh"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <curand_kernel.h>
@@ -51,12 +52,46 @@ void gpu_zero(float* ptr, size_t count) {
 // cuBLAS matmul (row-major via column-major swap)
 // ============================================================================
 
+// All matmuls keep fp32 storage and fp32 accumulation; the compute type only chooses how
+// cuBLAS multiplies. BF16 rounds the inputs to bfloat16 on the fly for tensor cores, which
+// is the numerics of PyTorch's bf16 autocast for matmuls (~2x FP32 on GeForce Ampere).
+static cublasComputeType_t g_compute_type = CUBLAS_COMPUTE_32F;
+
+void gpu_set_matmul_precision(MatmulPrecision p) {
+  g_compute_type = p == MatmulPrecision::BF16   ? CUBLAS_COMPUTE_32F_FAST_16BF
+                   : p == MatmulPrecision::TF32 ? CUBLAS_COMPUTE_32F_FAST_TF32
+                                                : CUBLAS_COMPUTE_32F;
+}
+
+namespace {
+
+// Same argument order as cublasSgemm, dispatched through cublasGemmEx
+cublasStatus_t sgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n,
+                     int k, const float* alpha, const float* A, int lda, const float* B, int ldb,
+                     const float* beta, float* C, int ldc) {
+  return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb, beta, C,
+                      CUDA_R_32F, ldc, g_compute_type, CUBLAS_GEMM_DEFAULT);
+}
+
+// Same argument order as cublasSgemmStridedBatched
+cublasStatus_t sgemm_strided_batched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,
+                                     int m, int n, int k, const float* alpha, const float* A,
+                                     int lda, long long sA, const float* B, int ldb, long long sB,
+                                     const float* beta, float* C, int ldc, long long sC,
+                                     int count) {
+  return cublasGemmStridedBatchedEx(h, ta, tb, m, n, k, alpha, A, CUDA_R_32F, lda, sA, B,
+                                    CUDA_R_32F, ldb, sB, beta, C, CUDA_R_32F, ldc, sC, count,
+                                    g_compute_type, CUBLAS_GEMM_DEFAULT);
+}
+
+}  // namespace
+
 // Row-major C = A × B  →  cuBLAS: C^T = B^T × A^T (column-major)
 // Call as: cublasSgemm(handle, N_op, T_op, N, M, K, α, B, ldb, A, lda, β, C, N)
 void gpu_matmul(cublasHandle_t handle, float* out, const float* a, const float* b, int M, int K,
                 int N) {
   float alpha = 1.0f, beta = 0.0f;
-  CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N, a, K, &beta,
+  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N, a, K, &beta,
                            out, N));
 }
 
@@ -64,7 +99,7 @@ void gpu_matmul(cublasHandle_t handle, float* out, const float* a, const float* 
 void gpu_matmul_transposed_a(cublasHandle_t handle, float* out, const float* a, const float* b,
                              int M, int K, int N, bool accumulate) {
   float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
-  CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N, a, M, &beta,
+  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N, a, M, &beta,
                            out, N));
 }
 
@@ -72,7 +107,7 @@ void gpu_matmul_transposed_a(cublasHandle_t handle, float* out, const float* a, 
 void gpu_matmul_transposed_b(cublasHandle_t handle, float* out, const float* a, const float* b,
                              int M, int K, int N) {
   float alpha = 1.0f, beta = 0.0f;
-  CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K, a, K, &beta,
+  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K, a, K, &beta,
                            out, N));
 }
 
@@ -84,7 +119,7 @@ void gpu_matmul_strided_batched_bt(cublasHandle_t handle, float* out, const floa
                                    long long strideA, long long strideB, long long strideC,
                                    int batch_count) {
   float alpha = 1.0f, beta = 0.0f;
-  CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K,
+  CUBLAS_CHECK(sgemm_strided_batched(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, b, K,
                                          strideB, a, K, strideA, &beta, out, N, strideC,
                                          batch_count));
 }
@@ -95,7 +130,7 @@ void gpu_matmul_strided_batched(cublasHandle_t handle, float* out, const float* 
                                 long long strideA, long long strideB, long long strideC,
                                 int batch_count) {
   float alpha = 1.0f, beta = 0.0f;
-  CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N,
+  CUBLAS_CHECK(sgemm_strided_batched(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, b, N,
                                          strideB, a, K, strideA, &beta, out, N, strideC,
                                          batch_count));
 }
@@ -106,7 +141,7 @@ void gpu_matmul_strided_batched_at(cublasHandle_t handle, float* out, const floa
                                    long long strideA, long long strideB, long long strideC,
                                    int batch_count) {
   float alpha = 1.0f, beta = 1.0f;  // beta=1 for accumulate
-  CUBLAS_CHECK(cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N,
+  CUBLAS_CHECK(sgemm_strided_batched(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, M, K, &alpha, b, N,
                                          strideB, a, M, strideA, &beta, out, N, strideC,
                                          batch_count));
 }
@@ -282,21 +317,35 @@ void gpu_add_bias(float* out, const float* bias, int rows, int cols) {
   CUDA_CHECK(cudaGetLastError());
 }
 
-// Reduce rows: dst[c] += sum_r src[r * cols + c]  (for bias gradient accumulation)
+// Reduce rows: dst[c] += sum_r src[r * cols + c]  (for bias gradient accumulation).
+// Blocks are 32 columns x 8 row-lanes; gridDim.y splits the rows so the whole GPU works on
+// tall inputs (B*S rows), and each block adds its partial column sums with one atomic.
+constexpr int kReduceCols = 32, kReduceLanes = 8;
+
 __global__ void reduce_rows_kernel(float* dst, const float* src, int rows, int cols) {
-  int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= cols) return;
+  __shared__ float partial[kReduceLanes][kReduceCols];
+  int c = blockIdx.x * kReduceCols + threadIdx.x;
   float sum = 0.0f;
-  for (int r = 0; r < rows; ++r) {
-    sum += src[r * cols + c];
+  if (c < cols) {
+    for (int r = blockIdx.y * kReduceLanes + threadIdx.y; r < rows;
+         r += gridDim.y * kReduceLanes) {
+      sum += src[static_cast<size_t>(r) * cols + c];
+    }
   }
-  dst[c] += sum;
+  partial[threadIdx.y][threadIdx.x] = sum;
+  __syncthreads();
+  if (threadIdx.y == 0 && c < cols) {
+    for (int lane = 1; lane < kReduceLanes; ++lane) sum += partial[lane][threadIdx.x];
+    atomicAdd(&dst[c], sum);
+  }
 }
 
 void gpu_reduce_rows(float* dst, const float* src, int rows, int cols) {
-  int threads = 256;
-  int blocks = (cols + threads - 1) / threads;
-  reduce_rows_kernel<<<blocks, threads>>>(dst, src, rows, cols);
+  dim3 threads(kReduceCols, kReduceLanes);
+  int col_blocks = (cols + kReduceCols - 1) / kReduceCols;
+  // ~64 rows per lane keeps atomics negligible while filling the GPU
+  int row_blocks = std::max(1, std::min(256, rows / (kReduceLanes * 64)));
+  reduce_rows_kernel<<<dim3(col_blocks, row_blocks), threads>>>(dst, src, rows, cols);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -491,9 +540,9 @@ void gpu_matmul_backward(cublasHandle_t handle, const float* dout, const float* 
   // da += dout × b^T
   float alpha = 1.0f, beta = 1.0f;  // beta=1 for accumulate
   CUBLAS_CHECK(
-      cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &alpha, b, N, dout, N, &beta, da, K));
+      sgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &alpha, b, N, dout, N, &beta, da, K));
   // db += a^T × dout
-  CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, &alpha, dout, N, a, K, &beta,
+  CUBLAS_CHECK(sgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, &alpha, dout, N, a, K, &beta,
                            db, N));
 }
 

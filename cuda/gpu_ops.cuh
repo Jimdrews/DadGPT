@@ -37,6 +37,11 @@ void gpu_copy_u16_to_device(uint16_t* dst, const uint16_t* src, size_t count);
 void gpu_zero(float* ptr, size_t count);
 
 // --- cuBLAS matmul (row-major) ---
+// Process-wide multiply precision for every matmul below. Storage and accumulation stay fp32.
+// FP32 (default) is exact fp32; TF32/BF16 round inputs for tensor cores (training speed).
+enum class MatmulPrecision { FP32, TF32, BF16 };
+void gpu_set_matmul_precision(MatmulPrecision p);
+
 // C = A × B where A is (M×K), B is (K×N), C is (M×N)
 void gpu_matmul(cublasHandle_t handle, float* out, const float* a, const float* b, int M, int K,
                 int N);

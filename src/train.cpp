@@ -97,6 +97,9 @@ void run_training(const TrainConfig& tc) {
   std::cout << "=== dad-gpt train ===\n\n";
 
   DatasetMeta meta = read_dataset_meta(tc.data_dir);
+  gpu_set_matmul_precision(tc.precision == "fp32"   ? MatmulPrecision::FP32
+                           : tc.precision == "tf32" ? MatmulPrecision::TF32
+                                                    : MatmulPrecision::BF16);
   Model model{};
   Adam opt;  // m and v live on GPU
 
@@ -185,12 +188,13 @@ void run_training(const TrainConfig& tc) {
   auto interval_start = std::chrono::steady_clock::now();
 
   while (opt.step < max_steps) {
-    model_zero_grad(model);
+    gpu_zero(model.gradients, model.param_offsets.total);
     float step_loss = 0.0f;
 
     for (int micro = 0; micro < tc.accumulation_steps; ++micro) {
       Batch batch = train_loader.random_batch(rng);
-      gpu_zero(model.activations, model.act_offsets.total);
+      // Forward overwrites every activation, but backward accumulates (+=) into activation
+      // gradients, so only those need clearing per micro-batch
       gpu_zero(model.grad_activations, model.act_offsets.total);
 
       model_forward(model, batch.tokens.data(), tc.batch_size, seq_len);
