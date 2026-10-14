@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format 18
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+
+      - name: Check formatting
+        run: |
+          git ls-files 'src/*.cpp' 'src/*.hpp' 'cuda/*.cu' 'cuda/*.cuh' 'tests/*.cpp' 'tests/*.hpp' \
+            | xargs clang-format-18 --dry-run --Werror
+
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      VCPKG_ROOT: /usr/local/share/vcpkg
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GCC 14 and Ninja
+        run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
+
+      - name: Install CUDA compiler and libraries
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-cccl-13-0 libcublas-dev-13-0 libcurand-dev-13-0
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+
+      - name: Update vcpkg
+        run: git -C "$VCPKG_ROOT" fetch --quiet origin && git -C "$VCPKG_ROOT" checkout --quiet origin/master
+
+      - name: Configure
+        run: |
+          cmake --preset release \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DCUDAToolkit_ROOT="$CUDA_HOME"
+
+      - name: Build
+        run: cmake --build --preset release

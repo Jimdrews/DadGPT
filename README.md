@@ -1,7 +1,53 @@
 # DadGPT
 
+[![CI](https://github.com/Jimdrews/DadGPT/actions/workflows/ci.yml/badge.svg)](https://github.com/Jimdrews/DadGPT/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus)
+![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900?logo=nvidia)
+
 A GPT-style transformer written from scratch in C++20 and CUDA that writes dad jokes. It can
 train its own small model or fine-tune OpenAI's GPT-2 (124M).
+
+There's no PyTorch and no Python at runtime. The tokenizers, forward and backward passes,
+optimizer, attention kernels and sampling are all written by hand.
+
+## Example output
+
+These come from the default `small` model (~25M parameters) after 800 training steps on the
+dad-jokes dataset. They're unedited:
+
+```text
+> Why don't skeletons fight each other?
+Because they are too cools
+
+> Why don't skeletons fight each other?
+Because they can get a broom
+
+> I told my wife
+I had a gravel
+
+> What do you call a fish with no eyes?
+A page
+
+> Why did the scarecrow win an award?
+Because he was drink
+```
+
+It's getting there. For actual punchlines, [fine-tune GPT-2](#fine-tune-gpt-2).
+
+## What's inside
+
+- **Hand-written CUDA kernels**: fused causal (flash-style) attention, softmax, layer norm,
+  GELU and dropout, with cuBLAS bf16 tensor-core matmuls.
+- **A complete training loop**: AdamW, warmup plus cosine LR, gradient accumulation, dropout,
+  periodic eval, and checkpoints that resume automatically.
+- **Fast generation**: a KV cache, batched prompt prefill, temperature, top-k and repetition
+  penalty.
+- **Two tokenizers**: a custom byte-level BPE trained on the jokes, and OpenAI's GPT-2 BPE.
+- **Loads Hugging Face GPT-2** directly from `model.safetensors`, checked against
+  `transformers` in the tests.
+- **Gradient-check tests** run finite differences over the whole model, with and without fused
+  attention and dropout. There are also compute-sanitizer memcheck and racecheck targets.
 
 ## Requirements
 
@@ -73,9 +119,34 @@ Run `dad-gpt` with no arguments for the full list of options.
 ctest --preset windows                # Linux: default
 ```
 
-The GPT-2 tests need the files in `data/gpt2` and are skipped without them. To regenerate
-their reference fixture with Hugging Face `transformers`:
+The tests need a CUDA GPU. The GPT-2 tests also need the files in `data/gpt2` and are skipped
+without them. To regenerate their reference fixture with Hugging Face `transformers`:
 
 ```sh
 uv run --script scripts/gpt2_reference.py data/gpt2 tests/fixtures/gpt2_reference.json
 ```
+
+## Project layout
+
+| Path | Contents |
+|---|---|
+| `src/` | tokenizers, data loading, model, backward pass, optimizer, training, generation, CLI |
+| `cuda/` | GPU kernels and cuBLAS wrappers, including fused attention |
+| `tests/` | GoogleTest suite, gradient checks and op benchmarks |
+| `scripts/` | Python script that builds the GPT-2 reference fixture |
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Acknowledgements
+
+- [GPT-2](https://huggingface.co/openai-community/gpt2) by OpenAI
+- The [shuttie/dadjokes](https://huggingface.co/datasets/shuttie/dadjokes) dataset, which
+  comes from Reddit's r/dadjokes
+- Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and
+  [llm.c](https://github.com/karpathy/llm.c), for showing that this is a reasonable thing to do
+
+## License
+
+[Apache-2.0](LICENSE). See [NOTICE](NOTICE) for third-party attributions.
