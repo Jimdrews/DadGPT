@@ -13,6 +13,7 @@
 
 #include "dataloader.hpp"
 #include "gpu_ops.cuh"
+#include "hf_gpt2.hpp"
 #include "model.hpp"
 #include "optimizer.hpp"
 
@@ -112,7 +113,15 @@ void run_training(const TrainConfig& tc) {
     // Don't replay the dropout masks of the first run (seeds advance once per dropout call)
     gpu_dropout_init(42ULL + static_cast<unsigned long long>(opt.step) * 1000003ULL, 0);
   } else {
-    model_alloc(model, build_config(tc, meta));
+    if (!tc.init_from.empty()) {
+      if (meta.tokenizer != "gpt2") {
+        throw std::runtime_error("--init-from needs data prepared with --tokenizer gpt2");
+      }
+      model_load_hf_gpt2(model, tc.init_from, tc.batch_size, tc.seq_len);
+      std::cout << std::format("Initialized from Hugging Face GPT-2 in {}\n", tc.init_from);
+    } else {
+      model_alloc(model, build_config(tc, meta));
+    }
     opt.num_params = model.param_offsets.total;
     opt.m = gpu_alloc(opt.num_params);
     opt.v = gpu_alloc(opt.num_params);

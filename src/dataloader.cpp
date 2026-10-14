@@ -85,6 +85,7 @@ DatasetMeta read_dataset_meta(const std::string& data_dir) {
     std::string key = line.substr(0, eq), value = line.substr(eq + 1);
     if (key == "tokenizer") meta.tokenizer = value;
     if (key == "vocab_size") meta.vocab_size = std::stoi(value);
+    if (key == "tokenizer_dir") meta.tokenizer_dir = value;
   }
   return meta;
 }
@@ -93,6 +94,7 @@ void write_dataset_meta(const std::string& data_dir, const DatasetMeta& meta) {
   std::ofstream f(data_dir + "/meta.txt");
   if (!f) throw std::runtime_error("Cannot write " + data_dir + "/meta.txt");
   f << "tokenizer=" << meta.tokenizer << "\nvocab_size=" << meta.vocab_size << "\n";
+  if (!meta.tokenizer_dir.empty()) f << "tokenizer_dir=" << meta.tokenizer_dir << "\n";
 }
 
 DataLoader::DataLoader(const std::string& path, int batch_size, int seq_len)

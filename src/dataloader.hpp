@@ -18,6 +18,7 @@ void write_token_file(const std::string& path, const std::vector<uint16_t>& toke
 struct DatasetMeta {
   std::string tokenizer = "dadbpe";  // "dadbpe" or "gpt2"
   int vocab_size = 512;
+  std::string tokenizer_dir;  // gpt2: directory holding vocab.json and merges.txt
 };
 DatasetMeta read_dataset_meta(const std::string& data_dir);
 void write_dataset_meta(const std::string& data_dir, const DatasetMeta& meta);

@@ -26,6 +26,8 @@ endif()
 add_subdirectory(cuda)
 
 find_package(GTest CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(PCRE2 CONFIG REQUIRED COMPONENTS 8BIT)
 
 enable_testing()
 

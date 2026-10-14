@@ -4,7 +4,7 @@ list(FILTER LIB_SOURCES EXCLUDE REGEX "main\\.cpp$")
 
 add_library(${PROJECT_NAME}-lib STATIC ${LIB_SOURCES})
 target_include_directories(${PROJECT_NAME}-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(${PROJECT_NAME}-lib PUBLIC ${PROJECT_NAME}-cuda)
+target_link_libraries(${PROJECT_NAME}-lib PUBLIC ${PROJECT_NAME}-cuda nlohmann_json::nlohmann_json PCRE2::8BIT)
 
 # Main executable
 add_executable(${PROJECT_NAME} main.cpp)

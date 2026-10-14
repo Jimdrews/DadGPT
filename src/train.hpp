@@ -9,6 +9,7 @@ struct TrainConfig {
   // Architecture: a preset (see model_preset) with optional overrides (0 = keep preset).
   // Ignored when resuming, since the checkpoint fixes the architecture.
   std::string model = "small";
+  std::string init_from;  // HF GPT-2 dir to fine-tune from (overrides model/d_model/...)
   int d_model = 0;
   int n_layers = 0;
   int n_heads = 0;

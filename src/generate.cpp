@@ -4,11 +4,14 @@
 #include <cmath>
 #include <format>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <vector>
 
+#include "gpt2_tokenizer.hpp"
 #include "gpu_ops.cuh"
+#include "hf_gpt2.hpp"
 
 uint16_t sample_token(std::vector<float> logits, const std::vector<uint16_t>& history,
                       float temperature, int top_k, float rep_penalty, std::mt19937& rng) {
@@ -90,7 +93,7 @@ uint16_t sample_token(std::vector<float> logits, const std::vector<uint16_t>& hi
 
 std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>& seed,
                                       float temperature, int top_k, int max_len,
-                                      float rep_penalty) {
+                                      float rep_penalty, int stop_token) {
   int ctx_len = model.config.ctx_len;
   max_len = std::min(max_len, ctx_len);
 
@@ -127,7 +130,7 @@ std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>&
     tokens.push_back(sampled);
 
     // Stop on end token or when the context is full
-    if (sampled == BPE::END_TOKEN || static_cast<int>(tokens.size()) >= max_len) break;
+    if (sampled == stop_token || static_cast<int>(tokens.size()) >= max_len) break;
 
     // Process the new token through KV cache
     model_forward_cached(model, cache, sampled, static_cast<int>(tokens.size()) - 1);
@@ -137,69 +140,120 @@ std::vector<uint16_t> generate_tokens(Model& model, const std::vector<uint16_t>&
   return tokens;
 }
 
-std::string generate_text(Model& model, const BPE& bpe, const GenerateConfig& config) {
-  // Build seed sequence
-  std::vector<uint16_t> seed;
-  seed.push_back(BPE::START_TOKEN);
+namespace {
 
-  if (!config.prompt.empty()) {
-    auto prompt_tokens = bpe.encode(config.prompt);
-    seed.insert(seed.end(), prompt_tokens.begin(), prompt_tokens.end());
-    seed.push_back(BPE::SEP_TOKEN);
-  }
-
-  // Generate
-  int max_len = config.max_len > 0 ? config.max_len : model.config.ctx_len;
-  auto tokens =
-      generate_tokens(model, seed, config.temperature, config.top_k, max_len, config.rep_penalty);
-
-  // Decode
-  std::string text = bpe.decode(tokens);
-
-  // Strip special tokens and format
-  auto replace_all = [](std::string& s, const std::string& from, const std::string& to) {
-    size_t pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-      s.replace(pos, from.length(), to);
-      pos += to.length();
-    }
-  };
-
-  replace_all(text, "<|start|>", "");
-  replace_all(text, "<|end|>", "");
-  replace_all(text, "<|sep|>", "\n");
-
-  // Trim leading/trailing whitespace
+void trim(std::string& text) {
   auto start = text.find_first_not_of(" \n\r\t");
   auto end = text.find_last_not_of(" \n\r\t");
-  if (start != std::string::npos) {
-    text = text.substr(start, end - start + 1);
-  }
+  text = start == std::string::npos ? std::string() : text.substr(start, end - start + 1);
+}
 
-  return text;
+// Dad-jokes BPE: START question SEP response END
+class DadBpeCodec : public TextCodec {
+ public:
+  explicit DadBpeCodec(const std::string& data_dir) {
+    bpe_.load(data_dir + "/vocab.bin", data_dir + "/merges.bin");
+  }
+  std::vector<uint16_t> seed(const std::string& prompt) const override {
+    std::vector<uint16_t> seed{BPE::START_TOKEN};
+    if (!prompt.empty()) {
+      auto prompt_tokens = bpe_.encode(prompt);
+      seed.insert(seed.end(), prompt_tokens.begin(), prompt_tokens.end());
+      seed.push_back(BPE::SEP_TOKEN);
+    }
+    return seed;
+  }
+  std::string render(const std::vector<uint16_t>& tokens) const override {
+    std::string text;
+    for (uint16_t t : tokens) {
+      if (t == BPE::START_TOKEN || t == BPE::END_TOKEN || t == BPE::PAD_TOKEN) continue;
+      text += t == BPE::SEP_TOKEN ? std::string("\n") : bpe_.decode({t});
+    }
+    trim(text);
+    return text;
+  }
+  int stop_token() const override { return BPE::END_TOKEN; }
+  std::string name() const override { return std::format("dadbpe ({} tokens)", bpe_.vocab_size()); }
+
+ private:
+  BPE bpe_;
+};
+
+// GPT-2 BPE: documents separated by <|endoftext|>; prepare writes jokes as "question\nresponse"
+class Gpt2Codec : public TextCodec {
+ public:
+  explicit Gpt2Codec(const std::string& dir) {
+    tok_.load(dir + "/vocab.json", dir + "/merges.txt");
+  }
+  std::vector<uint16_t> seed(const std::string& prompt) const override {
+    std::vector<uint16_t> seed{Gpt2Tokenizer::EOT};
+    if (!prompt.empty()) {
+      auto ids = tok_.encode(prompt + "\n");
+      seed.insert(seed.end(), ids.begin(), ids.end());
+    }
+    return seed;
+  }
+  std::string render(const std::vector<uint16_t>& tokens) const override {
+    std::vector<uint16_t> body;
+    for (uint16_t t : tokens) {
+      if (t != Gpt2Tokenizer::EOT) body.push_back(t);
+    }
+    std::string text = tok_.decode(body);
+    trim(text);
+    return text;
+  }
+  int stop_token() const override { return Gpt2Tokenizer::EOT; }
+  std::string name() const override { return "gpt2 (50257 tokens)"; }
+
+ private:
+  Gpt2Tokenizer tok_;
+};
+
+}  // namespace
+
+std::unique_ptr<TextCodec> make_codec(const DatasetMeta& meta, const std::string& data_dir) {
+  if (meta.tokenizer == "gpt2") return std::make_unique<Gpt2Codec>(meta.tokenizer_dir);
+  if (meta.tokenizer == "dadbpe") return std::make_unique<DadBpeCodec>(data_dir);
+  throw std::runtime_error("Unknown tokenizer '" + meta.tokenizer + "' in meta.txt");
+}
+
+std::string generate_text(Model& model, const TextCodec& codec, const GenerateConfig& config) {
+  int max_len = config.max_len > 0 ? config.max_len : model.config.ctx_len;
+  auto tokens = generate_tokens(model, codec.seed(config.prompt), config.temperature,
+                                config.top_k, max_len, config.rep_penalty, codec.stop_token());
+  return codec.render(tokens);
 }
 
 void run_generate(const GenerateConfig& config) {
   std::cout << "=== dad-gpt generate ===\n\n";
 
-  // Load tokenizer
-  BPE bpe;
-  bpe.load(config.data_dir + "/vocab.bin", config.data_dir + "/merges.bin");
-  std::cout << std::format("Loaded tokenizer (vocab_size={})\n", bpe.vocab_size());
-
-  // Load model
   Model model{};
-  model_load(model, config.checkpoint_path, /*batch_size=*/1);  // inference needs one row
+  std::unique_ptr<TextCodec> codec;
+  if (!config.hf_dir.empty()) {
+    // Pretrained Hugging Face GPT-2 straight from config.json + model.safetensors
+    model_load_hf_gpt2(model, config.hf_dir, /*batch_size=*/1);
+    codec = std::make_unique<Gpt2Codec>(config.hf_dir);
+    std::cout << std::format("Loaded Hugging Face GPT-2 from {}\n", config.hf_dir);
+  } else {
+    DatasetMeta meta = read_dataset_meta(config.data_dir);
+    codec = make_codec(meta, config.data_dir);
+    model_load(model, config.checkpoint_path, /*batch_size=*/1);  // inference needs one row
+    if (model.config.vocab_size != meta.vocab_size) {
+      throw std::runtime_error(std::format("Checkpoint vocab {} != tokenizer vocab {}",
+                                           model.config.vocab_size, meta.vocab_size));
+    }
+    std::cout << std::format("Loaded checkpoint: {}\n", config.checkpoint_path);
+  }
   model.training = false;
-  std::cout << std::format("Loaded checkpoint: {}\n", config.checkpoint_path);
+  std::cout << std::format("Tokenizer: {}\n", codec->name());
   std::cout << std::format("Temperature: {}, Top-k: {}\n\n", config.temperature, config.top_k);
 
   for (int i = 0; i < config.count; ++i) {
-    std::string joke = generate_text(model, bpe, config);
+    std::string text = generate_text(model, *codec, config);
     if (config.count > 1) {
       std::cout << std::format("[{}/{}] ", i + 1, config.count);
     }
-    std::cout << joke << "\n\n";
+    std::cout << text << "\n\n";
   }
 
   model_free(model);

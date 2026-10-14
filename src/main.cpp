@@ -10,11 +10,55 @@
 #include "csv_parser.hpp"
 #include "dataloader.hpp"
 #include "generate.hpp"
+#include "gpt2_tokenizer.hpp"
 #include "train.hpp"
 
 namespace {
 
-int prepare(const std::string& data_dir) {
+// GPT-2 tokenization: each joke becomes "question\nresponse", documents separated by
+// <|endoftext|> (nanoGPT style), so a fine-tuned GPT-2 sees text in its native format.
+int prepare_gpt2(const std::string& data_dir, const std::string& gpt2_dir,
+                 const std::vector<Joke>& train_jokes, const std::vector<Joke>& test_jokes) {
+  Gpt2Tokenizer tok;
+  tok.load(gpt2_dir + "/vocab.json", gpt2_dir + "/merges.txt");
+  std::cout << std::format("\nEncoding with GPT-2 BPE from {}...\n", gpt2_dir);
+
+  auto encode_jokes = [&tok](const std::vector<Joke>& jokes) {
+    std::vector<uint16_t> tokens;
+    for (const auto& joke : jokes) {
+      tokens.push_back(Gpt2Tokenizer::EOT);
+      auto ids = tok.encode(joke.question + "\n" + joke.response);
+      tokens.insert(tokens.end(), ids.begin(), ids.end());
+    }
+    tokens.push_back(Gpt2Tokenizer::EOT);
+    return tokens;
+  };
+  auto train_tokens = encode_jokes(train_jokes);
+  auto val_tokens = encode_jokes(test_jokes);
+  std::cout << std::format("  Train tokens: {}\n  Val tokens:   {}\n", train_tokens.size(),
+                           val_tokens.size());
+
+  write_token_file(data_dir + "/train.bin", train_tokens);
+  write_token_file(data_dir + "/val.bin", val_tokens);
+  write_dataset_meta(data_dir, {"gpt2", tok.vocab_size(), gpt2_dir});
+  std::cout << "  Saved train.bin, val.bin and meta.txt\n";
+
+  std::cout << "\n--- Sample decode (first 2 jokes from train) ---\n";
+  size_t end = 1;
+  for (int shown = 0; shown < 2 && end < train_tokens.size(); ++shown) {
+    size_t start = end;
+    while (end < train_tokens.size() && train_tokens[end] != Gpt2Tokenizer::EOT) ++end;
+    std::cout << tok.decode({train_tokens.begin() + static_cast<std::ptrdiff_t>(start),
+                             train_tokens.begin() + static_cast<std::ptrdiff_t>(end)})
+              << "\n<|endoftext|>\n";
+    ++end;
+  }
+  std::cout << "\nDone!\n";
+  return 0;
+}
+
+int prepare(const std::string& data_dir, const std::string& tokenizer,
+            const std::string& gpt2_dir) {
   constexpr int VOCAB_SIZE = 512;
 
   std::cout << "=== dad-gpt prepare ===\n\n";
@@ -25,6 +69,9 @@ int prepare(const std::string& data_dir) {
   auto test_jokes = parse_jokes_csv(data_dir + "/test.csv");
   std::cout << std::format("  Train: {} jokes\n", train_jokes.size());
   std::cout << std::format("  Test:  {} jokes\n", test_jokes.size());
+
+  if (tokenizer == "gpt2") return prepare_gpt2(data_dir, gpt2_dir, train_jokes, test_jokes);
+  if (tokenizer != "dadbpe") throw std::invalid_argument("--tokenizer must be dadbpe or gpt2");
 
   // Build corpus for BPE training (train split only)
   std::string corpus;
@@ -116,10 +163,13 @@ void print_usage() {
 Usage: dad-gpt <command> [options]
 
   prepare [data_dir]          Tokenize data_dir/{train,test}.csv into train.bin / val.bin
+    --tokenizer NAME          dadbpe (train a 512-token BPE) | gpt2 (OpenAI's 50257 BPE)
+    --gpt2-dir DIR            vocab.json + merges.txt for gpt2 (default data/gpt2)
 
   train                       Train (resumes from the latest data/checkpoint_step_N.bin)
     --data DIR                data directory (default data)
     --model NAME              tiny | small | gpt2-124m (default small)
+    --init-from DIR           fine-tune pretrained HF GPT-2 (config.json + model.safetensors)
     --d-model N --layers N --heads N --seq-len N     override the preset
     --batch N --accum N       micro-batch size and gradient accumulation steps
     --steps N | --epochs F    optimizer steps, or passes over the training tokens
@@ -129,6 +179,7 @@ Usage: dad-gpt <command> [options]
   generate                    Sample from a checkpoint
     --data DIR                data directory with meta.txt and the tokenizer
     --checkpoint PATH         default: latest checkpoint in --data
+    --hf DIR                  sample from pretrained HF GPT-2 instead of a checkpoint
     --prompt TEXT --count N --max-len N
     --temp F (0 = greedy) --top-k N --rep-penalty F
 )";
@@ -138,7 +189,18 @@ int run(int argc, char* argv[]) {
   std::string cmd = argc >= 2 ? argv[1] : "";
 
   if (cmd == "prepare") {
-    return prepare(argc >= 3 ? argv[2] : "data");
+    std::string data_dir = "data", tokenizer = "dadbpe", gpt2_dir = "data/gpt2";
+    int first = 2;
+    if (argc >= 3 && std::string(argv[2]).rfind("--", 0) != 0) {
+      data_dir = argv[2];
+      first = 3;
+    }
+    parse_flags(argc, argv, first,
+                {
+                    {"--tokenizer", [&](const std::string& v) { tokenizer = v; }},
+                    {"--gpt2-dir", [&](const std::string& v) { gpt2_dir = v; }},
+                });
+    return prepare(data_dir, tokenizer, gpt2_dir);
   }
 
   if (cmd == "train") {
@@ -149,6 +211,7 @@ int run(int argc, char* argv[]) {
                 {
                     {"--data", [&](const std::string& v) { tc.data_dir = v; }},
                     {"--model", [&](const std::string& v) { tc.model = v; }},
+                    {"--init-from", [&](const std::string& v) { tc.init_from = v; }},
                     {"--d-model", i(tc.d_model)},
                     {"--layers", i(tc.n_layers)},
                     {"--heads", i(tc.n_heads)},
@@ -186,6 +249,7 @@ int run(int argc, char* argv[]) {
                 {
                     {"--data", [&](const std::string& v) { data_dir = v; }},
                     {"--checkpoint", [&](const std::string& v) { gc.checkpoint_path = v; }},
+                    {"--hf", [&](const std::string& v) { gc.hf_dir = v; }},
                     {"--temp", [&](const std::string& v) { gc.temperature = std::stof(v); }},
                     {"--top-k", [&](const std::string& v) { gc.top_k = std::stoi(v); }},
                     {"--count", [&](const std::string& v) { gc.count = std::stoi(v); }},
@@ -195,7 +259,7 @@ int run(int argc, char* argv[]) {
                 });
     gc.data_dir = data_dir;
     if (gc.checkpoint_path.empty()) gc.checkpoint_path = find_latest_checkpoint(data_dir);
-    if (gc.checkpoint_path.empty()) {
+    if (gc.checkpoint_path.empty() && gc.hf_dir.empty()) {
       throw std::invalid_argument("No checkpoint_step_*.bin in " + data_dir +
                                   "; pass --checkpoint");
     }
