@@ -121,6 +121,14 @@ int main(int argc, char* argv[]) {
         tc.weight_decay = std::stof(argv[++i]);
       }
     }
+    if (tc.dropout_rate < 0.0f || tc.dropout_rate >= 1.0f) {
+      std::cerr << "--dropout must be in [0, 1)\n";
+      return 1;
+    }
+    if (tc.accumulation_steps < 1 || tc.batch_size < 1 || tc.epochs < 1) {
+      std::cerr << "--accum, --batch and --epochs must be >= 1\n";
+      return 1;
+    }
     run_training(tc);
     return 0;
   }
@@ -155,9 +163,10 @@ int main(int argc, char* argv[]) {
   std::cout << "\nUsage: dad-gpt <command>\n";
   std::cout << "  prepare [data_dir]              - Tokenize dataset\n";
   std::cout << "  train [--epochs N] [--batch N]  - Train the model\n";
-  std::cout << "        [--data DIR]\n";
-  std::cout << "  generate [--temp F] [--top-k N] - Generate jokes\n";
-  std::cout << "           [--count N] [--prompt TEXT]\n";
+  std::cout << "        [--data DIR] [--accum N] [--dropout F] [--wd F]\n";
+  std::cout << "  generate [--temp F] [--top-k N] - Generate jokes (--temp 0 = greedy)\n";
+  std::cout << "           [--count N] [--prompt TEXT] [--rep-penalty F]\n";
+  std::cout << "           [--checkpoint PATH] [--vocab PATH] [--merges PATH]\n";
 
   return 0;
 }
