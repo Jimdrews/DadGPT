@@ -1,13 +1,68 @@
 #include "dataloader.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+
+namespace {
+
+// Read-only memory map of a whole file. Returns the base pointer and sets size.
+void* map_file(const std::string& path, size_t& size) {
+#ifdef _WIN32
+  HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open " + path);
+  LARGE_INTEGER li{};
+  if (!GetFileSizeEx(file, &li)) {
+    CloseHandle(file);
+    throw std::runtime_error("Cannot stat " + path);
+  }
+  size = static_cast<size_t>(li.QuadPart);
+  HANDLE mapping = size ? CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+  CloseHandle(file);
+  if (mapping == nullptr) throw std::runtime_error("mmap failed for " + path);
+  void* mapped = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+  CloseHandle(mapping);  // the view keeps the mapping alive
+  if (mapped == nullptr) throw std::runtime_error("mmap failed for " + path);
+  return mapped;
+#else
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) throw std::runtime_error("Cannot open " + path);
+  struct stat st {};
+  if (fstat(fd, &st) != 0) {
+    close(fd);
+    throw std::runtime_error("Cannot stat " + path);
+  }
+  size = static_cast<size_t>(st.st_size);
+  void* mapped = size ? mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+  close(fd);
+  if (mapped == MAP_FAILED) throw std::runtime_error("mmap failed for " + path);
+  return mapped;
+#endif
+}
+
+void unmap_file(void* base, size_t size) {
+#ifdef _WIN32
+  (void)size;
+  UnmapViewOfFile(base);
+#else
+  munmap(base, size);
+#endif
+}
+
+}  // namespace
 
 void write_token_file(const std::string& path, const std::vector<uint16_t>& tokens) {
   std::ofstream f(path, std::ios::binary);
@@ -21,22 +76,18 @@ void write_token_file(const std::string& path, const std::vector<uint16_t>& toke
 
 DataLoader::DataLoader(const std::string& path, int batch_size, int seq_len)
     : batch_size_(batch_size), seq_len_(seq_len) {
-  int fd = open(path.c_str(), O_RDONLY);
-  if (fd < 0) throw std::runtime_error("Cannot open " + path);
+  void* mapped = map_file(path, file_size_);
 
-  struct stat st {};
-  fstat(fd, &st);
-  file_size_ = static_cast<size_t>(st.st_size);
-
-  void* mapped = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd, 0);
-  close(fd);
-
-  if (mapped == MAP_FAILED) {
-    throw std::runtime_error("mmap failed for " + path);
+  // Read token count from header and make sure the file actually holds that many tokens
+  if (file_size_ < sizeof(uint64_t)) {
+    unmap_file(mapped, file_size_);
+    throw std::runtime_error("Token file too small: " + path);
   }
-
-  // Read token count from header
   std::memcpy(&num_tokens_, mapped, sizeof(uint64_t));
+  if (num_tokens_ > (file_size_ - sizeof(uint64_t)) / sizeof(uint16_t)) {
+    unmap_file(mapped, file_size_);
+    throw std::runtime_error("Token file header count exceeds file size: " + path);
+  }
 
   // Data starts after the uint64_t header
   data_ = reinterpret_cast<uint16_t*>(static_cast<char*>(mapped) + sizeof(uint64_t));
@@ -44,8 +95,7 @@ DataLoader::DataLoader(const std::string& path, int batch_size, int seq_len)
 
 DataLoader::~DataLoader() {
   if (data_ != nullptr) {
-    void* base = reinterpret_cast<char*>(data_) - sizeof(uint64_t);
-    munmap(base, file_size_);
+    unmap_file(reinterpret_cast<char*>(data_) - sizeof(uint64_t), file_size_);
   }
 }
 
@@ -63,8 +113,7 @@ DataLoader::DataLoader(DataLoader&& other) noexcept
 DataLoader& DataLoader::operator=(DataLoader&& other) noexcept {
   if (this != &other) {
     if (data_ != nullptr) {
-      void* base = reinterpret_cast<char*>(data_) - sizeof(uint64_t);
-      munmap(base, file_size_);
+      unmap_file(reinterpret_cast<char*>(data_) - sizeof(uint64_t), file_size_);
     }
     data_ = other.data_;
     num_tokens_ = other.num_tokens_;

@@ -7,22 +7,24 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(CheckLanguage)
-check_language(CUDA)
-if(CMAKE_CUDA_COMPILER)
-  enable_language(CUDA)
-  set(CMAKE_CUDA_STANDARD 20)
-  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# CUDA is required: the model, training and generation all run on the GPU.
+# Override the target GPU with -DCMAKE_CUDA_ARCHITECTURES=<sm> (default 86, RTX 30xx).
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 86)
-  find_package(CUDAToolkit REQUIRED)
-  add_subdirectory(cuda)
-  set(DAD_GPT_CUDA_ENABLED ON)
-else()
-  message(STATUS "CUDA not found — building without GPU support")
-  set(DAD_GPT_CUDA_ENABLED OFF)
+endif()
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+find_package(CUDAToolkit REQUIRED)
+
+if(MSVC)
+  # Sources contain UTF-8 comments; keep M_PI-style macros and min/max sane on Windows
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 endif()
 
-find_package(nlohmann_json CONFIG REQUIRED)
+add_subdirectory(cuda)
+
 find_package(GTest CONFIG REQUIRED)
 
 enable_testing()
@@ -84,6 +86,16 @@ add_custom_target(gpu-memcheck
         $<TARGET_FILE:${PROJECT_NAME}-tests>
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Running compute-sanitizer memcheck on tests"
+    DEPENDS ${PROJECT_NAME}-tests
+    VERBATIM
+)
+
+# gpu-racecheck: detect shared-memory races in kernels (e.g. reductions missing __syncthreads)
+add_custom_target(gpu-racecheck
+    COMMAND compute-sanitizer --tool racecheck --racecheck-report all
+        $<TARGET_FILE:${PROJECT_NAME}-tests>
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Running compute-sanitizer racecheck on tests"
     DEPENDS ${PROJECT_NAME}-tests
     VERBATIM
 )

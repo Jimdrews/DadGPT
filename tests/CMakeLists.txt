@@ -7,4 +7,5 @@ add_executable(${PROJECT_NAME}-tests ${TEST_SOURCES})
 target_link_libraries(${PROJECT_NAME}-tests PRIVATE GTest::gtest_main ${PROJECT_NAME}-lib)
 
 include(GoogleTest)
-gtest_discover_tests(${PROJECT_NAME}-tests)
+# PRE_TEST: discover at ctest time, so building never needs the CUDA runtime DLLs on PATH
+gtest_discover_tests(${PROJECT_NAME}-tests DISCOVERY_MODE PRE_TEST)

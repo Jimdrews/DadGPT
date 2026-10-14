@@ -4,7 +4,6 @@
   "description": "A small GPT-style transformer that generates dad jokes",
   "builtin-baseline": "00d9442575c9f66ce33eb29faadef341cb4cefda",
   "dependencies": [
-    "nlohmann-json",
     "gtest"
   ]
 }
