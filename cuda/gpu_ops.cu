@@ -48,6 +48,10 @@ void gpu_zero(float* ptr, size_t count) {
   CUDA_CHECK(cudaMemset(ptr, 0, count * sizeof(float)));
 }
 
+void gpu_memory_info(size_t& free_bytes, size_t& total_bytes) {
+  CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+}
+
 // ============================================================================
 // cuBLAS matmul (row-major via column-major swap)
 // ============================================================================

@@ -139,6 +139,9 @@ void run_training(const TrainConfig& tc) {
   }
   model.training = true;
   model.dropout_rate = tc.dropout_rate;
+  model.attention = tc.attention == "fused"          ? AttentionImpl::Fused
+                    : tc.attention == "materialized" ? AttentionImpl::Materialized
+                                                     : AttentionImpl::Auto;
 
   opt.max_lr = tc.max_lr;
   opt.warmup_steps = tc.warmup_steps;
@@ -184,6 +187,7 @@ void run_training(const TrainConfig& tc) {
 
   double interval_loss = 0.0;
   int interval_steps = 0;
+  const int start_step = opt.step;
   int consecutive_skips = 0;
   auto interval_start = std::chrono::steady_clock::now();
 
@@ -236,6 +240,19 @@ void run_training(const TrainConfig& tc) {
 
     interval_loss += step_loss;
     ++interval_steps;
+    if (interval_steps == 1 && opt.step == start_step + 1) {
+      // All buffers (including lazily allocated attention ones) exist after the first step.
+      // When they exceed VRAM, the Windows driver's sysmem fallback pages to system RAM
+      // instead of failing, which silently makes training several times slower.
+      size_t free_b = 0, total_b = 0;
+      gpu_memory_info(free_b, total_b);
+      std::cout << std::format("  GPU memory: {:.2f} / {:.2f} GB used\n",
+                               (total_b - free_b) / 1e9, total_b / 1e9);
+      if (free_b < total_b / 50) {
+        std::cerr << "  warning: GPU memory is (nearly) full. If the driver spills to system "
+                     "RAM, training slows down sharply; reduce --batch or use --attention fused.\n";
+      }
+    }
     if (opt.step % tc.log_interval == 0) {
       auto now = std::chrono::steady_clock::now();
       double secs = std::chrono::duration<double>(now - interval_start).count();

@@ -50,7 +50,7 @@ struct ActivationOffsets {
     size_t ln1_out;
     size_t q, k, v;              // [seq_len × d_model] (after projection)
     size_t q_heads, k_heads, v_heads;  // [n_heads × seq_len × d_head] (reshaped for cuBLAS)
-    size_t attn_scores;          // [n_heads × seq_len × seq_len]
+    size_t attn_lse;             // [B*H × seq_len] softmax row logsumexps (fused path)
     size_t attn_out_heads;       // [n_heads × seq_len × d_head]
     size_t attn_out;             // [seq_len × d_model] (reshaped back)
     size_t attn_proj;            // [seq_len × d_model]
@@ -62,12 +62,11 @@ struct ActivationOffsets {
     size_t residual2;            // [seq_len × d_model]
   };
 
-  // Dropout mask offsets (uint8, separate buffer from float activations)
+  // Dropout mask offsets (uint8, separate buffer from float activations). Attention
+  // probability masks live in Model::attn_masks with the rest of the materialized path.
   struct DropoutMasks {
-    size_t emb;          // after embedding
-    size_t attn_scores;  // after attention softmax
-    size_t attn_proj;    // after attention output projection
-    size_t mlp;          // after MLP fc2
+    size_t attn_proj;  // after attention output projection
+    size_t mlp;        // after MLP fc2
   };
   std::vector<DropoutMasks> drop_masks;
   size_t drop_emb;       // embedding dropout mask
@@ -79,6 +78,8 @@ struct ActivationOffsets {
   size_t total;
 };
 
+enum class AttentionImpl { Auto, Fused, Materialized };
+
 struct Model {
   ModelConfig config;
   bool training = true;
@@ -89,11 +90,22 @@ struct Model {
   float* activations = nullptr;
   float* gradients = nullptr;
   float* grad_activations = nullptr;
-  float* temp_scores = nullptr;  // pre-allocated temp buffer for backward attention
   uint8_t* dropout_masks = nullptr;
   uint8_t* decay_flags = nullptr;  // per-param weight decay flags for AdamW
   uint16_t* d_tokens = nullptr;    // device buffer for input tokens
-  float* attn_dropped = nullptr;   // dropout(softmax) per layer, allocated on first use
+  float* attn_delta = nullptr;     // [B*H × ctx] fused-attention backward scratch
+
+  // Fused attention (cuda/attention.cu) never stores the [S, S] matrix: at GPT-2's ctx 1024
+  // and batch 4 it needs 8.7 GB instead of 11.9 GB, but its fp32 backward is ~1.5x slower
+  // than the cuBLAS materialized path. Auto uses fused for ctx_len >= 512. Attention-
+  // probability dropout always takes the materialized path, whose [B*H, ctx, ctx] buffers are
+  // allocated the first time it runs.
+  AttentionImpl attention = AttentionImpl::Auto;
+  float* attn_probs = nullptr;    // per layer: softmax P
+  float* attn_dropped = nullptr;  // per layer: dropout(P)
+  uint8_t* attn_masks = nullptr;  // per layer: dropout mask
+  float* attn_grad = nullptr;     // dP for the layer being backpropagated
+  float* attn_temp = nullptr;     // d(scores) for the layer being backpropagated
   ParameterOffsets param_offsets;
   ActivationOffsets act_offsets;
   cublasHandle_t cublas_handle = nullptr;

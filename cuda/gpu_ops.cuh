@@ -35,6 +35,8 @@ void gpu_copy_to_device(float* dst, const float* src, size_t count);
 void gpu_copy_to_host(float* dst, const float* src, size_t count);
 void gpu_copy_u16_to_device(uint16_t* dst, const uint16_t* src, size_t count);
 void gpu_zero(float* ptr, size_t count);
+// Free and total device memory in bytes (cudaMemGetInfo)
+void gpu_memory_info(size_t& free_bytes, size_t& total_bytes);
 
 // --- cuBLAS matmul (row-major) ---
 // Process-wide multiply precision for every matmul below. Storage and accumulation stay fp32.
@@ -110,6 +112,18 @@ void gpu_causal_mask(float* scores, int num_blocks, int seq_len);
 void gpu_causal_mask_zero(float* grads, int num_blocks, int seq_len);
 // Scale all elements: data[i] *= scale
 void gpu_scale(float* data, int size, float scale);
+
+// --- Fused causal attention (cuda/attention.cu) ---
+// q, k, v, out: [BH, S, d_head]; lse: [BH, S] row logsumexps saved for backward.
+// Computes out = softmax(mask(q k^T * scale)) v without materializing the [S, S] scores.
+bool gpu_flash_attention_supported(int d_head);
+void gpu_flash_attention_forward(float* out, float* lse, const float* q, const float* k,
+                                 const float* v, int BH, int S, int d_head, float scale);
+// Writes (does not accumulate) dq, dk, dv. delta: [BH, S] scratch.
+void gpu_flash_attention_backward(float* dq, float* dk, float* dv, float* delta,
+                                  const float* dout, const float* out, const float* lse,
+                                  const float* q, const float* k, const float* v, int BH, int S,
+                                  int d_head, float scale);
 
 // --- Dropout kernels ---
 // Initialize cuRAND states (call once)

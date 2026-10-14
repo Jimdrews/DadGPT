@@ -145,14 +145,41 @@ TEST(Bench, DISABLED_TrainingStepBreakdown) {
                 gpu_adamw_step(model.params, model.gradients, m, v, model.decay_flags, n, 1e-4f,
                                0.9f, 0.95f, 1e-8f, 0.1f, 1);
               }, 5));
-  std::printf("dropout fwd on attention scores (%d elems): %.2f ms\n", B * c.n_heads * S * S,
-              time_ms([&] {
-                gpu_dropout_forward(model.temp_scores, model.act(model.act_offsets.layers[0].attn_scores),
-                                    model.drop_mask(model.act_offsets.drop_masks[0].attn_scores),
-                                    B * c.n_heads * S * S, 0.1f);
-              }));
   gpu_free(m);
   gpu_free(v);
   gpu_free(d_targets);
   model_free(model);
+}
+
+TEST(Bench, DISABLED_FusedVsMaterializedAttention) {
+  // Whole-model forward+backward with dropout off, at the small preset's context and at
+  // GPT-2's, so the attention share of the step grows with S
+  for (auto [preset, B] : {std::pair{"small", 64}, std::pair{"gpt2-124m", 4}}) {
+    ModelConfig c = model_preset(preset);
+    c.vocab_size = 512;
+    c.batch_size = B;
+    int S = c.ctx_len, BS = B * S;
+    std::vector<uint16_t> tokens(BS);
+    for (int i = 0; i < BS; ++i) tokens[i] = static_cast<uint16_t>((i * 37) % c.vocab_size);
+    uint16_t* d_targets = gpu_alloc_u16(BS);
+    gpu_copy_u16_to_device(d_targets, tokens.data(), BS);
+
+    for (bool materialized : {true, false}) {
+      Model model{};
+      model_alloc(model, c);
+      model.training = false;
+      model.attention = materialized ? AttentionImpl::Materialized : AttentionImpl::Fused;
+      float fwd = time_ms([&] { model_forward(model, tokens.data(), B, S); }, 3);
+      gpu_cross_entropy_loss(model.grad_act(model.act_offsets.logits),
+                             model.act(model.act_offsets.logits), d_targets, BS, c.vocab_size);
+      float bwd = time_ms([&] { model_backward(model, tokens.data(), B, S); }, 3);
+      size_t free_b = 0, total_b = 0;
+      CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+      std::printf("%-9s B=%-2d S=%-4d %-12s forward %7.1f ms  backward %7.1f ms  GPU mem used %.2f GB\n",
+                  preset, B, S, materialized ? "materialized" : "fused", fwd, bwd,
+                  (total_b - free_b) / 1e9);
+      model_free(model);
+    }
+    gpu_free(d_targets);
+  }
 }

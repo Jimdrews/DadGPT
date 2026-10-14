@@ -16,12 +16,13 @@
 namespace {
 
 // Small but complete model: 2 layers so residual chaining between layers is exercised.
-ModelConfig tiny_config(int batch_size) {
+// d_head 8 runs attention on the materialized path; d_model 64 (d_head 32) on the fused one.
+ModelConfig tiny_config(int batch_size, int d_model = 16) {
   ModelConfig config;
-  config.d_model = 16;
+  config.d_model = d_model;
   config.n_layers = 2;
   config.n_heads = 2;
-  config.d_ff = 32;
+  config.d_ff = 2 * d_model;
   config.ctx_len = 8;
   config.vocab_size = 20;
   config.batch_size = batch_size;
@@ -229,10 +230,12 @@ TEST(Backward, GpuSoftmaxRowsSumToOne) {
 // tied token embedding, positional embedding) with batch 2 and seq_len < ctx_len.
 // With dropout, every forward re-seeds the RNG so all passes see identical masks and the
 // loss stays a deterministic, smooth function of the parameters.
-void full_model_gradient_check(float dropout_rate) {
-  ModelConfig config = tiny_config(2);
+void full_model_gradient_check(float dropout_rate, int d_model = 16,
+                                AttentionImpl attention = AttentionImpl::Auto) {
+  ModelConfig config = tiny_config(2, d_model);
   Model model{};
   model_alloc(model, config);
+  model.attention = attention;
   model.training = dropout_rate > 0.0f;
   model.dropout_rate = dropout_rate;
 
@@ -294,6 +297,12 @@ void full_model_gradient_check(float dropout_rate) {
 }
 
 TEST(Backward, FullModelGradientCheck) { full_model_gradient_check(0.0f); }
+
+// d_head 32 with dropout off: attention goes through the fused (flash) kernels
+TEST(Backward, FullModelGradientCheckFusedAttention) {
+  ASSERT_TRUE(gpu_flash_attention_supported(32));
+  full_model_gradient_check(0.0f, 64, AttentionImpl::Fused);
+}
 
 // Covers the dropout backward at all four sites, including attention probabilities.
 TEST(Backward, FullModelGradientCheckWithDropout) { full_model_gradient_check(0.3f); }
@@ -418,4 +427,54 @@ TEST(Backward, OverfitsSingleBatch) {
   gpu_free(v);
   gpu_free(d_targets);
   model_free(model);
+}
+
+TEST(Backward, FusedAttentionMatchesMaterialized) {
+  // Several 32-row tiles with a ragged last tile (S = 70), batch 2, d_head 64: logits and every
+  // parameter gradient must agree between the fused kernels and the materialized path.
+  ModelConfig config = tiny_config(2, 128);
+  config.ctx_len = 80;
+  const int batch = 2, seq_len = 70, rows = batch * seq_len;
+  std::vector<uint16_t> tokens(rows), targets(rows);
+  for (int i = 0; i < rows; ++i) {
+    tokens[i] = static_cast<uint16_t>((i * 7 + 3) % config.vocab_size);
+    targets[i] = static_cast<uint16_t>((i * 11 + 5) % config.vocab_size);
+  }
+  uint16_t* d_targets = gpu_alloc_u16(rows);
+  gpu_copy_u16_to_device(d_targets, targets.data(), rows);
+
+  auto run = [&](bool materialized, std::vector<float>& logits, std::vector<float>& grads) {
+    Model model{};
+    model_alloc(model, config);  // deterministic init: both models get identical weights
+    model.training = false;
+    model.attention = materialized ? AttentionImpl::Materialized : AttentionImpl::Fused;
+    model_zero_grad(model);
+    forward_loss(model, tokens.data(), d_targets, batch, seq_len);
+    logits.resize(static_cast<size_t>(rows) * config.vocab_size);
+    gpu_copy_to_host(logits.data(), model.act(model.act_offsets.logits), logits.size());
+    model_backward(model, tokens.data(), batch, seq_len);
+    grads.resize(model.param_offsets.total);
+    gpu_copy_to_host(grads.data(), model.gradients, grads.size());
+    auto groups = all_param_groups(model);
+    model_free(model);
+    return groups;
+  };
+  std::vector<float> logits_m, grads_m, logits_f, grads_f;
+  run(true, logits_m, grads_m);
+  auto groups = run(false, logits_f, grads_f);
+
+  for (size_t i = 0; i < logits_m.size(); ++i) {
+    ASSERT_NEAR(logits_f[i], logits_m[i], 1e-4) << "logit " << i;
+  }
+  for (const auto& g : groups) {
+    if (is_key_bias(g)) continue;  // exact gradient is zero; only float noise to compare
+    double diff_sq = 0.0, ref_sq = 0.0;
+    for (size_t i = g.offset; i < g.offset + g.size; ++i) {
+      diff_sq += static_cast<double>(grads_f[i] - grads_m[i]) * (grads_f[i] - grads_m[i]);
+      ref_sq += static_cast<double>(grads_m[i]) * grads_m[i];
+    }
+    double rel = std::sqrt(diff_sq / std::max(ref_sq, 1e-20));
+    EXPECT_LT(rel, 1e-4) << g.name << " fused vs materialized relative error " << rel;
+  }
+  gpu_free(d_targets);
 }

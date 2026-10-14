@@ -27,6 +27,8 @@ struct TrainConfig {
   uint64_t seed = 1337;
   // Matmul multiply precision: bf16 (tensor cores, fp32 accumulate), tf32, or fp32
   std::string precision = "bf16";
+  // auto (fused for ctx >= 512) | fused (least memory) | materialized (fastest when it fits)
+  std::string attention = "auto";
 
   // Logging, evaluation and checkpoints (all in optimizer steps)
   int log_interval = 10;
