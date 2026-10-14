@@ -9,7 +9,7 @@ jobs:
   format:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install clang-format 18
         run: sudo apt-get update && sudo apt-get install -y clang-format-18
@@ -22,9 +22,9 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     env:
-      VCPKG_ROOT: /usr/local/share/vcpkg
+      VCPKG_ROOT: ${{ github.workspace }}/../vcpkg
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install GCC 14 and Ninja
         run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
@@ -38,8 +38,10 @@ jobs:
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-cccl-13-0 libcublas-dev-13-0 libcurand-dev-13-0
           echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
 
-      - name: Update vcpkg
-        run: git -C "$VCPKG_ROOT" fetch --quiet origin && git -C "$VCPKG_ROOT" checkout --quiet origin/master
+      - name: Install vcpkg
+        run: |
+          git clone --quiet https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
 
       - name: Configure
         run: |
